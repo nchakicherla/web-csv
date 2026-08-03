@@ -6,7 +6,9 @@ tree-walking interpreter, compiled to WASM. Numeric *and* categorical
 columns are supported (`col()`, `filter_gt()`, `groupby()` with
 sum/count/avg/min/max aggregates). Parallelizable operations (currently:
 summing a numeric column) run as WebGPU compute shaders on eligible
-hardware, falling back to plain WASM otherwise. Results render as bar
+hardware, falling back to plain WASM otherwise - as either `gpu_sum()`
+(fast, f32 - see the precision tradeoff below) or `gpu_sum_exact()`
+(same GPU parallelism, but exact, for money). Results render as bar
 charts, stat tiles, or tables (`web/src/charts/`, no chart library - plain
 SVG/DOM against the dataviz skill's reference palette), and a query can be
 saved as a dashboard tile, assembled with others, and persisted. A small
@@ -132,6 +134,7 @@ Upload it and run:
 ```
 emit(sum(col("amount")));
 emit(gpu_sum(col("amount")));
+emit(gpu_sum_exact(col("amount")));
 groupby(col("category"), col("amount"), "sum");
 groupby(col("month"));
 ```
@@ -140,14 +143,25 @@ Expected, verified two independent ways (a plain-JS reduce over the raw
 CSV, and the real interpreter under Node) before ever touching a browser,
 then confirmed a third way in the real browser:
 
-- `sum(col("amount"))` -> **`26559531.42`** (exact - the CPU path stays f64)
+- `sum(col("amount"))` -> **`26559531.420000315`** - "exact" in the sense
+  of not losing precision to the GPU path, but note it isn't a clean
+  `.42` either: ordinary f64 addition has its own small representation
+  noise summing 100,000 decimal amounts (money is exactly where floats in
+  general are a known footgun, not just the f32-specific GPU issue below).
 - `gpu_sum(col("amount"))` -> **a close but *different* number** (in one
   real run, `26559531.3515625`) - and that's correct, not a bug: past the
   threshold this genuinely dispatches through `reduce_sum.wgsl` on the
   GPU, which sums in f32 (WGSL has no f64 - see ARCHITECTURE.md §8), so
-  a little drift on a sum this large is expected. If it ever comes back
+  visible drift on a sum this large is expected. If it ever comes back
   bit-identical to the CPU sum, that's the more suspicious result - it'd
   suggest the CPU fallback silently ran instead.
+- `gpu_sum_exact(col("amount"))` -> **`26559531.42`** - clean, and
+  genuinely exact, not merely close: it converts every value to integer
+  cents before upload and sums as `i32` on the GPU (`reduce_sum_i32.wgsl`),
+  and integer addition doesn't round. Confirmed to match a real dispatch
+  through actual `GPUBuffer`s, not the CPU fallback - see ARCHITECTURE.md
+  §8's "Fixing gpu_sum's precision, for money" for how and why this works
+  and what it assumes.
 - `groupby(col("category"), col("amount"), "sum")` -> `{coffee: 188033.92,
   groceries: 3433538.13, utilities: 2156688.61, dining: 1158195.76,
   transport: 676631.37, electronics: 9594373.57, rent: 3451725.51,
@@ -268,6 +282,15 @@ with real WebGPU hardware:
     CPU sum (real f32 rounding drift - see "A larger CSV" above). Every
     value cross-checked against an independent plain-JS computation over
     the raw file before ever touching the interpreter.
+11. ✅ `gpu_sum_exact()` - the integer-cents GPU path that fixes #10's
+    drift for money - works correctly, verified the same three ways as
+    every other builtin, plus one more: the real browser test explicitly
+    confirmed dispatch reached the actual `reduceSumExact` bridge function
+    (not just inferred it from the result), and its GPU-computed result
+    on a hand-checkable dataset (`-300`) matched hand calculation exactly.
+    Against `transactions-large.csv` it returned a clean `26559531.42`
+    where both `sum` and `gpu_sum` show floating-point noise of different
+    kinds - see "A larger CSV" above.
 
 ### Bugs found doing the above (all fixed)
 
@@ -315,15 +338,24 @@ rather than a TODO waiting to be picked up:
 - Only three chart forms exist: stat tile (a bare number), bar chart (a
   `groupby` result), and table (a raw column or the accessibility twin of
   a bar chart). There's no line/time-series chart, because there's no
-  date/time column type yet to plot against - see the column-types gap.
+  date/time column type yet to plot against (`month` in the larger sample
+  CSV is just an ordinary categorical column, not a real date type).
 - Loading a saved dashboard doesn't auto-run it (a deliberate choice: the
   CSV needs to be loaded first, and running immediately against nothing
   loaded would just error) - the user has to click "Run dashboard"
   afterward, which is one extra click but avoids a confusing failure.
-- Only `sum` has a GPU path. `filter_gt`/`groupby` are CPU-only; GPU
-  filter/groupby/sort/join are all real engineering effort (see
-  ARCHITECTURE.md's shader-scope note) - a project on their own, not a
-  quick follow-up.
+- Only `sum` has a GPU path (as `gpu_sum` and, exactly, `gpu_sum_exact`).
+  `filter_gt`/`groupby` are CPU-only; GPU filter/groupby/sort/join are all
+  real engineering effort (see ARCHITECTURE.md's shader-scope note) - a
+  project on their own, not a quick follow-up.
+- `gpu_sum_exact()` assumes at most 2 meaningful decimal places (it rounds
+  to the nearest cent - the standard accounting assumption, but a real one:
+  sub-cent data would be silently rounded), and its i32-bounded GPU path
+  tops out around ±$21.47M in cents - past that (checked via a conservative
+  sum-of-absolute-values bound, not the actual total, so it triggers a bit
+  before the true limit) it transparently falls back to the same exact
+  answer computed on CPU, never an overflowed one, just not GPU-accelerated
+  for that column.
 - `groupby()`'s dictionary build (`columnCreateStrDict`) is an O(n *
   distinct_values) linear scan against the dict-so-far, not a hash table -
   fine for a CSV's worth of categories (tens to low hundreds), not for

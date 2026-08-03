@@ -113,6 +113,13 @@ that dispatches them; **WGSL** is the language they're written in.
 "Parallel reduction" is the standard GPU technique for doing that with
 many threads. See §8.
 
+**Fixed-point representation** — storing a decimal number as a scaled
+integer (`$42.50` as the integer `4250`, "cents") instead of a float.
+Integer arithmetic has no rounding, so this trades a fixed, known
+precision (whatever the scale factor covers - 2 decimal places, here) for
+exactness - the classic reason financial software avoids floats. See §8's
+`gpu_sum_exact`.
+
 **Asyncify** — an Emscripten feature that lets compiled C code pause
 mid-call, wait on a JavaScript promise, and resume. See §7.
 
@@ -253,8 +260,8 @@ interp/                   the analysis engine, written in C
   ext/                      web-csv's own C layer
     column.h/.c              the column type                    (§5)
     store.h/.c               the session's live columns         (§5)
-    builtins_gpu.h/.c        col/sum/gpu_sum/filter_gt/
-                             groupby/emit                       (§7)
+    builtins_gpu.h/.c        col/sum/gpu_sum/gpu_sum_exact/
+                             filter_gt/groupby/emit              (§7)
     web_main.c               entry points JS calls (wc_run, …)
     Makefile                 the emcc build
     test/                    native C tests + a WASM smoke test  (§12)
@@ -439,7 +446,8 @@ function name:
 |---|---|
 | `col("name")` | look a column up in the store |
 | `sum(col)` | CPU sum of a numeric column |
-| `gpu_sum(col)` | same, but eligible for the GPU path (§8) |
+| `gpu_sum(col)` | same, but eligible for the GPU path, f32, approximate (§8) |
+| `gpu_sum_exact(col)` | same GPU eligibility, integer cents, exact (§8) |
 | `filter_gt(col, n)` | new column of values greater than `n` |
 | `groupby(cat)` | count of rows per category |
 | `groupby(cat, num, agg)` | `sum`/`count`/`avg`/`min`/`max` per category |
@@ -546,15 +554,74 @@ class of problem behind floating-point surprises in any analysis tool —
 worth knowing about generally, not just here.
 
 The mitigation is the eligibility gate below: the CPU path stays exact
-f64, and it's what small or precision-sensitive sums take.
+f64, and it's what small or precision-sensitive sums take. For a large
+sum that specifically needs to be *exact* - money - there's a stronger
+fix than just falling back to CPU, below.
+
+### Fixing gpu_sum's precision, for money
+
+`gpu_sum_exact(col)` gets real GPU acceleration *and* an exact answer, by
+sidestepping floating point entirely rather than trying to make f32 more
+precise. The technique is **fixed-point representation**: instead of
+storing `$42.50` as a float and hoping additions round kindly, store it as
+the integer `4250` (cents) and do the arithmetic in integers. Integer
+addition has no rounding step at all — `4250 + 1999` is `6249`, exactly,
+every time, in any order, on any hardware. WGSL's `i32` is a real,
+first-class type (unlike f64), so this works as native GPU arithmetic, not
+an emulation trick.
+
+`doGpuSumExact` (`builtins_gpu.c`):
+
+1. Converts every value to cents (`llround(value * 100)`), building an
+   `i32` array to upload — and, as a free side effect of that single pass
+   over the column, also accumulates the *exact* total as an `int64_t`.
+   One pass does double duty: preparing the GPU buffer and computing the
+   CPU-exact answer are the same work.
+2. Checks an overflow guard (next paragraph). If it fails, or the column
+   doesn't clear the same `WC_GPU_MIN_LEN` threshold as `gpu_sum`, or GPU
+   isn't available — it returns the already-computed exact CPU total
+   directly. Unlike `gpu_sum`, there is no "CPU fallback" in the sense of
+   a *different, slower* path: the CPU total was always right there.
+3. Otherwise, it dispatches to
+   [`reduce_sum_i32.wgsl`](../web/src/gpu/shaders/reduce_sum_i32.wgsl) —
+   the same two-stage tree reduction as `reduce_sum.wgsl`, over `i32`
+   instead of `f32` — and divides the result by 100 back into dollars.
+
+**The overflow guard.** A tree reduction's *intermediate* partial sums
+aren't bounded by the final total when values can cancel (a big charge and
+a big refund summing to something small) — but they're always bounded by
+the sum of every value's *absolute* value, in any grouping or order. So
+checking `Σ|cents| ≤ INT32_MAX` (roughly ±$21.47M in cents) is enough to
+guarantee no `i32` overflow anywhere in the reduction, not merely in the
+answer. This is a conservative check — it can decline GPU dispatch for a
+column that would actually have been fine — deliberately, since a
+conservative-but-safe check is worth more here than a tighter one that's
+harder to prove correct.
+
+**Why the GPU and CPU answers are now guaranteed to match, not just
+close.** Integer addition is associative — `(a+b)+c` and `a+(b+c)` give
+identical results, exactly, unlike float addition, where rounding at each
+step makes the order matter. That's *why* `gpu_sum`'s tree-shaped
+reduction can disagree with a linear CPU sum: same values, different
+grouping, different rounding. `gpu_sum_exact`'s tree reduction has no such
+risk — a real dispatch, confirmed in the browser against a hand-checkable
+dataset, returned a value that matched by-hand arithmetic exactly (see
+README's "A larger CSV").
+
+**What this assumes, honestly.** Two decimal places of meaningful
+precision (cents) — sub-cent data is silently rounded, the standard
+accounting assumption but a real one to know about. And the ±$21.47M
+bound above, past which the answer is still exact, just not
+GPU-accelerated for that column.
 
 ### The eligibility gate
 
-Three conditions must *all* hold before work goes to the GPU (`doSum` in
-`builtins_gpu.c`):
+Three conditions must *all* hold before work goes to the GPU (`doSum` and
+`doGpuSumExact` in `builtins_gpu.c`):
 
 1. **The operation suits the GPU** — a columnar reduction, not branchy
-   per-row scripting. Only `sum` is wired for this today.
+   per-row scripting. Only `sum` (as `gpu_sum` and `gpu_sum_exact`) is
+   wired for this today.
 2. **The column is large enough** — at least `WC_GPU_MIN_LEN` (50,000)
    elements. Below that the CPU wins, because uploading a buffer,
    dispatching a pipeline, and reading the result back all cost real time
@@ -562,19 +629,28 @@ Three conditions must *all* hold before work goes to the GPU (`doSum` in
    guess.*
 3. **WebGPU is actually available** — `navigator.gpu` resolves an adapter.
 
-Fail any one and the exact-f64 CPU loop runs instead. This is the general
+`gpu_sum_exact` adds a fourth, its own overflow guard (previous section) -
+none of these three conditions know or care about integer overflow, since
+they're shared with `gpu_sum`'s float path, which has no such concept.
+
+Fail any one and the exact CPU loop runs instead - f64 for `gpu_sum`, the
+already-computed exact `int64_t` total for `gpu_sum_exact`. This is the general
 lesson worth taking from the GPU section: parallel hardware has a fixed
 setup cost, so it only pays off past a data-size threshold, and knowing
 where that threshold is matters more than knowing the shader.
 
 ### Shader scope
 
-`reduce_sum.wgsl` is the only shader here. A GPU filter (predicate → mask)
-is the natural next one; a GPU `groupby` would extend the same reduction
-idea, keyed by category code instead of one global bucket. Sort and
-hash-join are established but genuinely substantial techniques (bitonic
-sort networks, GPU hash joins) and are out of scope — the CPU covers all
-of these today.
+Two shaders exist: `reduce_sum.wgsl` (f32, `gpu_sum`) and
+`reduce_sum_i32.wgsl` (i32, `gpu_sum_exact`) — the same tree-reduction
+structure, differing only in element type, which is also why
+`bridge.js`'s `dispatchReduction` helper runs both rather than each having
+its own copy of the buffer/dispatch/readback plumbing. A GPU filter
+(predicate → mask) is the natural next one; a GPU `groupby` would extend
+the same reduction idea, keyed by category code instead of one global
+bucket. Sort and hash-join are established but genuinely substantial
+techniques (bitonic sort networks, GPU hash joins) and are out of scope —
+the CPU covers all of these today.
 
 ---
 
@@ -659,7 +735,8 @@ oversight.
 | 2-arg `groupby` rejected outright | genuinely ambiguous — is arg 2 the numeric column or the aggregate name? | one more arity to remember |
 | `ASYNCIFY=1` (instrument everything) | correct with no analysis needed | size/speed cost in code that never awaits |
 | GPU threshold at 50,000 | dispatch overhead must be earned back | unbenchmarked guess; may be wrong in either direction |
-| GPU sums in f32 | WGSL has no f64 | precision drift on large/wide-ranging sums (§8) |
+| GPU sums in f32 (`gpu_sum`) | WGSL has no f64 | precision drift on large/wide-ranging sums (§8) |
+| `gpu_sum_exact` uses fixed-point (cents), not f32 | sidesteps float rounding entirely for money, rather than tolerating it | assumes ≤2 decimal places; i32-bounded to ±$21.47M in cents |
 | Only `sum` has a GPU path | filter/groupby/sort/join on GPU are each real projects | everything else stays CPU-bound |
 | Dashboards persist queries, not data | results always reflect current data | need the right CSV loaded before running |
 | Dev-stub auth | real auth is the user's decision to make | unusable beyond localhost as-is |
@@ -696,6 +773,15 @@ CSV") showed the expected f32 drift directly: `gpu_sum` returned a value
 close to but genuinely different from the exact f64 CPU sum — the correct
 outcome, not a bug, and better confirmation than an exact match would have
 been that the real shader ran rather than a fallback.
+
+**`gpu_sum_exact`'s real GPU path**, verified more strongly than `gpu_sum`'s
+since exactness is the whole point: a browser test explicitly confirmed
+dispatch reached the actual `reduceSumExact` bridge function (not merely
+inferred from the answer), and its result on a hand-checkable 60,000-value
+dataset (`-300`) matched hand arithmetic exactly. Against
+`transactions-large.csv` it returned a clean `26559531.42`, where both
+`sum` (f64) and `gpu_sum` (f32) show floating-point noise of different
+kinds - see README's "A larger CSV".
 
 **The full UI**, in a real browser: CSV upload through the actual file
 input, queries returning hand-checked values, each result shape rendering
@@ -757,11 +843,14 @@ order builds up naturally:
    `columnCreateStrDict` is dictionary encoding in about 40 lines.
 4. **[`interp/ext/builtins_gpu.c`](../interp/ext/builtins_gpu.c)** — the
    operations. `doGroupby` is the one to read closely; it's a complete
-   grouped-aggregation engine in one pass.
+   grouped-aggregation engine in one pass. `doGpuSumExact` right above it
+   is a worked example of fixed-point arithmetic (§8, §2) fixing a real
+   precision bug rather than just describing one.
 5. **[`resources/grammar-csv.txt`](../resources/grammar-csv.txt)** — the
    language, as data. Try changing a keyword and rerunning.
 6. **[`web/src/gpu/shaders/reduce_sum.wgsl`](../web/src/gpu/shaders/reduce_sum.wgsl)**
-   — the parallel reduction (§8), about 40 lines.
+   and its i32 sibling, `reduce_sum_i32.wgsl` — the parallel reduction
+   (§8), about 40 lines each, differing only in element type.
 7. **[`web/src/gpu/bridge.js`](../web/src/gpu/bridge.js)** — what actually
    dispatching GPU work looks like: buffers, bind groups, readback.
 8. **[`interp/vendor/repl2/src/interp.c`](../interp/vendor/repl2/src/interp.c)**

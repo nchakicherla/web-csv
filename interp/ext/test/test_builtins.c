@@ -37,6 +37,7 @@ extern int wc_run(const char *source);
 /* js_stubs.c */
 extern int g_wc_gpu_available;
 extern int g_gpu_path_taken;
+extern int g_gpu_exact_path_taken;
 extern double g_emitted[64];
 extern int g_n_emitted;
 extern char g_group_labels_joined[256];
@@ -51,6 +52,7 @@ extern uint32_t g_n_emitted_col_str;
 static void resetEmitted(void) {
 	g_n_emitted = 0;
 	g_gpu_path_taken = 0;
+	g_gpu_exact_path_taken = 0;
 	g_group_n = 0;
 	g_group_labels_joined[0] = '\0';
 	g_n_emitted_col_f64 = 0;
@@ -282,6 +284,43 @@ static void test_groupby_rejects_two_args(void) {
 	CHECK(rrc == -3, "groupby with exactly 2 args is a runtime error, not silently misinterpreted");
 }
 
+static void test_gpu_sum_exact_below_threshold_is_exact_and_cpu_only(void) {
+	resetEmitted();
+	g_wc_gpu_available = 1; /* even with the GPU "available"... */
+	double vals[] = {19.99, 42.50, 999.99, 0.01, -5.25};
+	wc_load_column_f64("money", vals, 5);
+
+	int rrc = wc_run("emit(gpu_sum_exact(col(\"money\")));");
+	CHECK(rrc == 0, "wc_run succeeds");
+	CHECK(g_gpu_exact_path_taken == 0, "...gpu_sum_exact still stays on the CPU path below WC_GPU_MIN_LEN");
+	CHECK_DBL_EQ(g_emitted[0], 19.99 + 42.50 + 999.99 + 0.01 - 5.25, "the cents-exact sum is correct, no float drift");
+
+	g_wc_gpu_available = 0;
+}
+
+static void test_gpu_sum_exact_above_threshold_matches_cpu_exactly(void) {
+	resetEmitted();
+	g_wc_gpu_available = 1;
+
+	static double big[60000];
+	int64_t expected_cents = 0;
+	for (int i = 0; i < 60000; i++) {
+		/* Mixed positive/negative, 2 decimal places - the shape real
+		 * amount+refund data would have. */
+		big[i] = (double)(i % 10000) / 100.0 - 50.0;
+		expected_cents += llround(big[i] * 100.0);
+	}
+	wc_load_column_f64("bigmoney", big, 60000);
+
+	int rrc = wc_run("emit(gpu_sum_exact(col(\"bigmoney\")));");
+	CHECK(rrc == 0, "wc_run succeeds");
+	CHECK(g_gpu_exact_path_taken == 1, "gpu_sum_exact takes the GPU branch once eligible (len >= threshold, GPU available)");
+	CHECK_DBL_EQ(g_emitted[0], (double)expected_cents / 100.0,
+	            "the GPU-path result matches the independently-computed exact cents sum bit-for-bit, not approximately");
+
+	g_wc_gpu_available = 0;
+}
+
 int main(void) {
 	test_init_and_basic_query();
 	test_sum_on_missing_column_is_a_runtime_error();
@@ -297,6 +336,8 @@ int main(void) {
 	test_emit_streams_full_categorical_column_resolved();
 	test_groupby_count_only_form();
 	test_groupby_rejects_two_args();
+	test_gpu_sum_exact_below_threshold_is_exact_and_cpu_only();
+	test_gpu_sum_exact_above_threshold_matches_cpu_exactly();
 
 	printf("\n%d passed, %d failed\n", g_pass, g_fail);
 	return g_fail == 0 ? 0 : 1;

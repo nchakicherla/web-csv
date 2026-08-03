@@ -146,4 +146,57 @@ test('wasm build smoke test', { skip: built ? false : 'run `make` in interp/ext/
 		// n=60000 split evenly across 4 categories by i % 4.
 		assert.deepEqual(mod.wcResults[0].values, [15000, 15000, 15000, 15000]);
 	});
+
+	await t.test('gpu_sum_exact takes the real GPU-eligible branch and matches the exact CPU sum bit-for-bit', async () => {
+		// Unlike gpu_sum's f32 path (which is only ever approximately
+		// correct - see the Asyncify test above, which deliberately uses
+		// data where f32 and f64 happen to agree), gpu_sum_exact's whole
+		// point is that the GPU result and the CPU result must be
+		// *identical*, since integer addition doesn't round. This asserts
+		// exact equality, not closeness.
+		const mod = await createInterpModule({ locateFile });
+
+		if (!globalThis.navigator) {
+			globalThis.navigator = {};
+		}
+		Object.defineProperty(globalThis.navigator, 'gpu', { value: {}, configurable: true });
+
+		let bridgeCalled = false;
+		mod.gpuBridge = {
+			async reduceSumExact(ptr, len) {
+				bridgeCalled = true;
+				await new Promise((resolve) => setTimeout(resolve, 50));
+				let total = 0n;
+				for (let i = 0; i < len; i++) total += BigInt(mod.HEAP32[(ptr >> 2) + i]);
+				return Number(total);
+			},
+		};
+
+		const rc1 = mod.ccall('wc_init', 'number', ['string'], ['/resources/grammar-csv.txt']);
+		assert.equal(rc1, 0);
+
+		const n = 60000;
+		const values = new Float64Array(n);
+		let expectedCents = 0n;
+		for (let i = 0; i < n; i++) {
+			values[i] = ((i % 10000) / 100) - 50; // mixed sign, 2 decimal places
+			expectedCents += BigInt(Math.round(values[i] * 100));
+		}
+		const ptr = mod._malloc(n * 8);
+		mod.HEAPF64.set(values, ptr >> 3);
+		const rc2 = mod.ccall('wc_load_column_f64', 'number', ['string', 'number', 'number'], ['bigmoney', ptr, n]);
+		mod._free(ptr);
+		assert.equal(rc2, 0);
+
+		mod.wcResults = [];
+		const run = mod.cwrap('wc_run', 'number', ['string'], { async: true });
+		const before = Date.now();
+		const rc3 = await run('emit(gpu_sum_exact(col("bigmoney")));');
+		const elapsed = Date.now() - before;
+
+		assert.equal(rc3, 0);
+		assert.equal(bridgeCalled, true, 'gpu_sum_exact should have reached the GPU-eligible branch');
+		assert.ok(elapsed >= 45, `expected the real ~50ms bridge delay (got ${elapsed}ms)`);
+		assert.equal(mod.wcResults[0], Number(expectedCents) / 100);
+	});
 });

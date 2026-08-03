@@ -43,8 +43,11 @@ EXPORTED_FUNCS = \
 # these instead of passing it as a ccall 'string' type - see main.js's
 # loadStringColumn for the real crash this fixes (a 100k-row categorical
 # column reliably segfaulted before this).
+# HEAP32: gpu_sum_exact()'s bridge (bridge.js's reduceSumExact) reads the
+# i32 array doGpuSumExact scaled and uploaded, the same way reduceSum
+# reads HEAPF64 for gpu_sum()'s f32 path.
 EXPORTED_RUNTIME = \
-  ccall,cwrap,FS,HEAPF64,UTF8ToString,lengthBytesUTF8,stringToUTF8
+  ccall,cwrap,FS,HEAPF64,HEAP32,UTF8ToString,lengthBytesUTF8,stringToUTF8
 
 # ASYNCIFY note: gpu_sum() (builtins_gpu.c) reaches an EM_ASYNC_JS import
 # (wcGpuReduceSum), so every function on the call path from wc_run() down

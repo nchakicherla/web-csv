@@ -1,14 +1,17 @@
 /* js_stubs.c - native stand-ins for what Emscripten's glue and
  * web/src/gpu/bridge.js provide in the real build: wcGpuAvailable(),
- * wcGpuReduceSum(), wcEmitNumber(), wcEmitGroups(), wcEmitNumberArray(),
- * and wcEmitStringArray() (all builtins_gpu.c). Lets test_builtins.c
- * drive wc_init/wc_load_column_f64/wc_load_column_str_dict/wc_run
- * (web_main.c) exactly as the real entry points, unmodified.
+ * wcGpuReduceSum(), wcGpuReduceSumExact(), wcEmitNumber(), wcEmitGroups(),
+ * wcEmitNumberArray(), and wcEmitStringArray() (all builtins_gpu.c). Lets
+ * test_builtins.c drive wc_init/wc_load_column_f64/
+ * wc_load_column_str_dict/wc_run (web_main.c) exactly as the real entry
+ * points, unmodified.
  *
- * g_wc_gpu_available and g_gpu_path_taken exist so tests can force and
- * then verify which branch gpu_sum's eligibility gate actually took,
- * rather than only checking the final numeric result (which would be
- * identical whether the CPU or "GPU" stub path ran).
+ * g_wc_gpu_available and g_gpu_path_taken/g_gpu_exact_path_taken exist so
+ * tests can force and then verify which branch gpu_sum()'s/
+ * gpu_sum_exact()'s eligibility gate actually took, rather than only
+ * checking the final numeric result (which would be identical whether the
+ * CPU or "GPU" stub path ran - especially true for gpu_sum_exact, whose
+ * whole point is that both paths agree exactly).
  */
 
 #include <stdint.h>
@@ -16,6 +19,7 @@
 
 int g_wc_gpu_available = 0;
 int g_gpu_path_taken = 0;
+int g_gpu_exact_path_taken = 0;
 
 double g_emitted[64];
 int g_n_emitted = 0;
@@ -47,6 +51,19 @@ double wcGpuReduceSum(double *ptr, uint32_t len) {
 		total += ptr[i];
 	}
 	return total;
+}
+
+double wcGpuReduceSumExact(int32_t *ptr, uint32_t len) {
+	g_gpu_exact_path_taken = 1;
+	/* int64 accumulator: the real bridge.js sums i32 partials (already
+	 * exact) in plain JS number arithmetic, which is f64 - exact for any
+	 * sum an i32-bounded reduction can produce. int64 here is the native
+	 * equivalent. */
+	int64_t total = 0;
+	for (uint32_t i = 0; i < len; i++) {
+		total += ptr[i];
+	}
+	return (double)total;
 }
 
 void wcEmitNumber(double v) {

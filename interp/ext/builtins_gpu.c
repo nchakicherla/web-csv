@@ -3,6 +3,7 @@
 #include "store.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <emscripten.h>
@@ -46,6 +47,15 @@ EM_JS(int, wcGpuAvailable, (void), {
  * interp/ext/Makefile's ASYNCIFY note. */
 EM_ASYNC_JS(double, wcGpuReduceSum, (double *ptr, uint32_t len), {
 	return await Module.gpuBridge.reduceSum(ptr, len);
+});
+
+/* gpu_sum_exact()'s async boundary - same shape as wcGpuReduceSum, but
+ * against web/src/gpu/shaders/reduce_sum_i32.wgsl over pre-scaled i32
+ * cents rather than raw f32 dollars. Integer addition doesn't round, so
+ * this result is exact - see doGpuSumExact below for the scaling and the
+ * overflow guard that makes it safe to call at all. */
+EM_ASYNC_JS(double, wcGpuReduceSumExact, (int32_t *ptr, uint32_t len), {
+	return await Module.gpuBridge.reduceSumExact(ptr, len);
 });
 
 /* groupby's output channel: `labels_joined` is `\x1f`-separated (see
@@ -99,6 +109,80 @@ static bool doSum(Object *args, size_t n_args, Object *out, bool allow_gpu) {
 	} else {
 		*out = objDbl(cpuSum(col));
 	}
+	return true;
+}
+
+/* gpu_sum_exact(col) - like gpu_sum, but exact: no float rounding at any
+ * point, at the cost of a documented assumption (values are money, at
+ * most 2 meaningful decimal places) instead of gpu_sum's silent f32
+ * precision loss on arbitrary magnitudes. See README's "A larger CSV"
+ * section for the real drift this replaces and ARCHITECTURE.md §8 for
+ * why WGSL's lack of f64 causes it in the first place.
+ *
+ * Each value is rounded to the nearest cent and converted to an integer
+ * (`llround(value * 100)`); the whole column is then summed as i32 -
+ * integer addition is exact and associative, so a GPU tree reduction and
+ * a plain CPU loop are *guaranteed* to agree bit-for-bit, not just
+ * approximately, unlike gpu_sum's f32 path. That CPU sum (as an int64,
+ * so it can't itself overflow at any realistic scale) is computed as a
+ * side effect of building the scaled array anyway - one pass over the
+ * column is needed either way - so this never has to return an
+ * approximate answer: below the GPU threshold, or when GPU access isn't
+ * available or safe, it returns that already-correct CPU total directly
+ * rather than attempting a dispatch just to get the same number back
+ * slower.
+ *
+ * Overflow guard: a tree reduction's intermediate partial sums aren't
+ * bounded by the final total when there's cancellation between positive
+ * and negative values (refunds, say) - but they're always bounded by the
+ * sum of *absolute* values, in any grouping or order. Checking that bound
+ * fits i32 is therefore sufficient to guarantee no overflow anywhere in
+ * the reduction, not just in the final answer. */
+static bool doGpuSumExact(Object *args, size_t n_args, Object *out) {
+	Column *col;
+	uint32_t len, i;
+	double *values;
+	int32_t *cents;
+	int64_t exact_cents = 0;
+	int64_t abs_cents = 0;
+
+	if (n_args != 1) {
+		return false;
+	}
+	col = objAsColumn(args[0]);
+	if (!col || columnType(col) != COL_F64) {
+		return false;
+	}
+
+	len = columnLen(col);
+	values = columnDataF64(col);
+
+	cents = malloc(sizeof(int32_t) * (len ? len : 1));
+	if (!cents) {
+		return false;
+	}
+
+	for (i = 0; i < len; i++) {
+		long long c = llround(values[i] * 100.0);
+		/* Only trusted for GPU use once abs_cents is confirmed to fit i32
+		 * below - the cast itself is implementation-defined, not
+		 * undefined, when c is out of range, and that branch never reads
+		 * this array; exact_cents (computed from the full-precision `c`,
+		 * not this cast) is what gets returned instead. */
+		cents[i] = (int32_t)c;
+		exact_cents += c;
+		abs_cents += (c < 0) ? -c : c;
+	}
+
+	if (abs_cents <= INT32_MAX && len >= WC_GPU_MIN_LEN && wcGpuAvailable()) {
+		double gpu_cents = wcGpuReduceSumExact(cents, len);
+		free(cents);
+		*out = objDbl(gpu_cents / 100.0);
+		return true;
+	}
+
+	free(cents);
+	*out = objDbl((double)exact_cents / 100.0);
 	return true;
 }
 
@@ -327,6 +411,9 @@ bool wcNativeDispatch(Interp *in, const char *name, size_t len, Object *args,
 	}
 	if (len == 7 && 0 == memcmp(name, "gpu_sum", 7)) {
 		return doSum(args, n_args, out, true);
+	}
+	if (len == 13 && 0 == memcmp(name, "gpu_sum_exact", 13)) {
+		return doGpuSumExact(args, n_args, out);
 	}
 	if (len == 9 && 0 == memcmp(name, "filter_gt", 9)) {
 		return doFilterGt(args, n_args, out);
