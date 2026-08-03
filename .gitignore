@@ -1,0 +1,19 @@
+node_modules/
+*.log
+.env
+.DS_Store
+
+# build outputs
+bin/
+obj/
+build/
+dist/
+*.wasm
+*.wasm.map
+interp/build/
+web/src/wasm/interp.js
+web/src/wasm/interp.wasm
+
+# sqlite data
+server/data/*.sqlite
+server/data/*.sqlite-journal

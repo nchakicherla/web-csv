@@ -1,0 +1,79 @@
+/* syntax.def - single source of truth for the built-in syntax vocabulary.
+ *
+ * Include with STX(name) defined. The enum and the name table are both
+ * generated from this list, so an entry can never end up with the wrong
+ * label. Grammar files may introduce additional syntax names at load time;
+ * those are interned by the registry and given IDs at or above STX__COUNT.
+ *
+ * Every name listed here is a compile-time constant, so the interpreter can
+ * switch on it. Names minted from a grammar file cannot be switched on - they
+ * parse fine and show up in the AST dump, but carry no built-in semantics.
+ */
+
+STX(STX_SCOPE)
+STX(STX_CLASS)
+STX(STX_FNDEF)
+STX(STX_IF)
+STX(STX_WHILE)
+STX(STX_FOR)
+STX(STX_FORRANGE)
+STX(STX_SWITCH)
+STX(STX_CASE)
+
+STX(STX_INIT)
+STX(STX_DECLARE)
+STX(STX_ASSIGN)
+STX(STX_ECHO)
+STX(STX_BREAK)
+STX(STX_RETURN)
+STX(STX_EXIT)
+
+STX(STX_GEXPR)
+STX(STX_EXPR)
+
+STX(STX_VTYPE)
+STX(STX_VAR)
+STX(STX_MEMBER)
+STX(STX_THIS)
+STX(STX_INDEX)
+STX(STX_FNCALL)
+STX(STX_NUM)
+STX(STX_STRLIT)
+STX(STX_NIL)
+
+STX(STX_ARITHOP)
+STX(STX_BOOLOP)
+STX(STX_ASSIGNOP)
+
+STX(STX_MULT)
+STX(STX_DIV)
+STX(STX_SUM)
+STX(STX_DIFF)
+STX(STX_MOD)
+
+STX(STX_TRUE)
+STX(STX_FALSE)
+STX(STX_AND)
+STX(STX_OR)
+STX(STX_NOT)
+STX(STX_GREATER)
+STX(STX_LESS)
+STX(STX_EQUAL_EQUAL)
+STX(STX_NOT_EQUAL)
+STX(STX_GREATER_EQUAL)
+STX(STX_LESS_EQUAL)
+
+STX(STX_RARROW)
+
+STX(STX_EQUAL)
+STX(STX_PLUS_EQUAL)
+STX(STX_MINUS_EQUAL)
+STX(STX_STAR_EQUAL)
+STX(STX_DIV_EQUAL)
+STX(STX_MOD_EQUAL)
+
+STX(STX_INCREMENT)
+STX(STX_DECREMENT)
+STX(STX_NEGATE)
+
+STX(STX_ERROR)

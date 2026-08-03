@@ -1,0 +1,81 @@
+/* token.def - single source of truth for the built-in token alphabet.
+ *
+ * Include with any subset of these macros defined; undefined ones expand away:
+ *
+ *   TK_PUNCT(name, lexeme)     operator/punctuation, matched longest-first
+ *   TK_KEYWORD(name, lexeme)   reserved word, matched after an identifier scan
+ *   TK_SPECIAL(name)           produced by scanner logic, no fixed lexeme
+ *
+ * The enum, the name table and the scanner's lookup tables are all generated
+ * from this list, so they cannot drift apart. Grammar files may add more
+ * tokens at load time via #token / #keyword directives.
+ *
+ * Multi-character punctuation must be listed before any prefix of itself is
+ * relied upon; the scanner tries two-character lexemes first regardless, but
+ * keeping them grouped up top makes the intent obvious.
+ */
+
+TK_PUNCT(TK_BANG_EQUAL,    "!=")
+TK_PUNCT(TK_EQUAL_EQUAL,   "==")
+TK_PUNCT(TK_GREATER_EQUAL, ">=")
+TK_PUNCT(TK_LESS_EQUAL,    "<=")
+
+TK_PUNCT(TK_LPAREN,    "(")
+TK_PUNCT(TK_RPAREN,    ")")
+TK_PUNCT(TK_LBRACE,    "{")
+TK_PUNCT(TK_RBRACE,    "}")
+TK_PUNCT(TK_LSQUARE,   "[")
+TK_PUNCT(TK_RSQUARE,   "]")
+TK_PUNCT(TK_COMMA,     ",")
+TK_PUNCT(TK_DOT,       ".")
+TK_PUNCT(TK_HASH,      "#")
+TK_PUNCT(TK_MINUS,     "-")
+TK_PUNCT(TK_PLUS,      "+")
+TK_PUNCT(TK_MOD,       "%")
+TK_PUNCT(TK_SEMICOLON, ";")
+TK_PUNCT(TK_FSLASH,    "/")
+TK_PUNCT(TK_STAR,      "*")
+TK_PUNCT(TK_COLON,     ":")
+TK_PUNCT(TK_PIPE,      "|")
+TK_PUNCT(TK_BANG,      "!")
+TK_PUNCT(TK_EQUAL,     "=")
+TK_PUNCT(TK_GREATER,   ">")
+TK_PUNCT(TK_LESS,      "<")
+
+TK_KEYWORD(TK_AND,    "and")
+TK_KEYWORD(TK_BOOL,   "bool")
+TK_KEYWORD(TK_BREAK,  "break")
+TK_KEYWORD(TK_CASE,   "case")
+TK_KEYWORD(TK_CLASS,  "class")
+TK_KEYWORD(TK_CONST,  "const")
+TK_KEYWORD(TK_FLT,    "flt")
+TK_KEYWORD(TK_ELSE,   "else")
+TK_KEYWORD(TK_EXIT,   "exit")
+TK_KEYWORD(TK_FALSE,  "false")
+TK_KEYWORD(TK_FN,     "fn")
+TK_KEYWORD(TK_FOR,    "for")
+TK_KEYWORD(TK_IF,     "if")
+TK_KEYWORD(TK_IN,     "in")
+TK_KEYWORD(TK_I64,    "i64")
+TK_KEYWORD(TK_I32,    "i32")
+TK_KEYWORD(TK_I16,    "i16")
+TK_KEYWORD(TK_I8,     "i8")
+TK_KEYWORD(TK_U64,    "u64")
+TK_KEYWORD(TK_U32,    "u32")
+TK_KEYWORD(TK_U16,    "u16")
+TK_KEYWORD(TK_U8,     "u8")
+TK_KEYWORD(TK_NIL,    "nil")
+TK_KEYWORD(TK_OR,     "or")
+TK_KEYWORD(TK_RETURN, "return")
+TK_KEYWORD(TK_SCOPE,  "scope")
+TK_KEYWORD(TK_STR,    "Str")
+TK_KEYWORD(TK_SWITCH, "switch")
+TK_KEYWORD(TK_THIS,   "this")
+TK_KEYWORD(TK_TRUE,   "true")
+TK_KEYWORD(TK_WHILE,  "while")
+
+TK_SPECIAL(TK_IDENTIFIER)
+TK_SPECIAL(TK_CHARS)
+TK_SPECIAL(TK_NUM)
+TK_SPECIAL(TK_EOF)
+TK_SPECIAL(TK_ERROR)

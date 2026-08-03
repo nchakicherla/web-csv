@@ -1,0 +1,77 @@
+// grammar-csv.txt - the default web-csv query/scripting grammar.
+//
+// Adapted from repl2's own resources/grammar-mini.txt (see
+// ../interp/vendor/VENDORED.md): `let x := expr;` instead of typed
+// declarations, no parens around if/loop conditions, and - unlike
+// grammar-mini - no wrapping { } required at the top level, so a query
+// cell can just be one or more bare statements.
+//
+// This is a general little scripting language, not SQL: `sum`, `col`,
+// `gpu_sum`, `filter_gt`, `emit` (interp/ext/builtins_gpu.c) are ordinary
+// function calls through STX_FNCALL, the same mechanism print() already
+// uses. Example, given a CSV column named "amount" loaded via
+// wc_load_column_f64():
+//
+//   let big := filter_gt(col("amount"), 100);
+//   emit(sum(big));
+//
+// A SELECT/FROM/WHERE surface syntax is a plausible next grammar to add,
+// but it needs its own STX_SELECT semantics wired into interp.c (or a
+// desugaring step repl2 doesn't have) to mean anything beyond parsing -
+// see ARCHITECTURE.md's "Grammar/DSL layer" section. This one is the
+// scaffold's proof that swapping DSL surface syntax without touching the
+// interpreter actually works, not a claim that it's the query language
+// end users will type.
+
+#keyword TK_LET  "let" ;
+#keyword TK_LOOP "loop" ;
+#token   TK_ASSIGN ":=" ;
+
+// The start symbol: a query cell is zero or more statements, no wrapping
+// braces required (contrast STX_SCOPE below, which if/loop bodies use).
+STX_PROGRAM = {STX_INIT | STX_ASSIGN | STX_IF | STX_WHILE | STX_ECHO} ;
+
+STX_SCOPE = TK_LBRACE, {STX_INIT | STX_ASSIGN | STX_IF | STX_WHILE | STX_ECHO}, TK_RBRACE ;
+
+STX_INIT   = TK_LET, STX_VAR, TK_ASSIGN, STX_EXPR, TK_SEMICOLON ;
+STX_ASSIGN = STX_VAR, STX_ASSIGNOP, STX_EXPR, TK_SEMICOLON ;
+STX_ECHO   = (STX_FNCALL | STX_EXPR), TK_SEMICOLON ;
+
+STX_IF    = TK_IF, STX_EXPR, STX_SCOPE, [TK_ELSE, STX_SCOPE] ;
+STX_WHILE = TK_LOOP, STX_EXPR, STX_SCOPE ;
+
+STX_EXPR = [STX_NOT | STX_NEGATE], (STX_GEXPR | STX_FNCALL | STX_VAR | STX_NUM | STX_STRLIT | STX_TRUE | STX_FALSE), {(STX_ARITHOP | STX_BOOLOP), [STX_NOT | STX_NEGATE], (STX_GEXPR | STX_FNCALL | STX_VAR | STX_NUM | STX_STRLIT | STX_TRUE | STX_FALSE)} ;
+
+STX_GEXPR  = TK_LPAREN, STX_EXPR, TK_RPAREN ;
+STX_FNCALL = TK_IDENTIFIER, TK_LPAREN, [STX_EXPR], {TK_COMMA, STX_EXPR}, TK_RPAREN ;
+
+STX_VAR    = TK_IDENTIFIER ;
+STX_NUM    = TK_NUM ;
+STX_STRLIT = TK_CHARS ;
+
+STX_ARITHOP  = STX_MULT | STX_DIV | STX_SUM | STX_DIFF | STX_MOD ;
+STX_BOOLOP   = STX_GREATER | STX_LESS | STX_NOT_EQUAL | STX_EQUAL_EQUAL | STX_GREATER_EQUAL | STX_LESS_EQUAL | STX_AND | STX_OR ;
+STX_ASSIGNOP = STX_EQUAL | STX_PLUS_EQUAL | STX_MINUS_EQUAL ;
+
+STX_MULT = TK_STAR ;
+STX_DIV  = TK_FSLASH ;
+STX_SUM  = TK_PLUS ;
+STX_DIFF = TK_MINUS ;
+STX_MOD  = TK_MOD ;
+
+STX_TRUE          = TK_TRUE ;
+STX_FALSE         = TK_FALSE ;
+STX_AND           = TK_AND ;
+STX_OR            = TK_OR ;
+STX_NOT           = TK_BANG ;
+STX_GREATER       = TK_GREATER ;
+STX_LESS          = TK_LESS ;
+STX_EQUAL_EQUAL   = TK_EQUAL_EQUAL ;
+STX_NOT_EQUAL     = TK_BANG_EQUAL ;
+STX_GREATER_EQUAL = TK_GREATER_EQUAL ;
+STX_LESS_EQUAL    = TK_LESS_EQUAL ;
+
+STX_EQUAL       = TK_EQUAL ;
+STX_PLUS_EQUAL  = TK_PLUS, TK_EQUAL ;
+STX_MINUS_EQUAL = TK_MINUS, TK_EQUAL ;
+STX_NEGATE      = TK_MINUS ;
