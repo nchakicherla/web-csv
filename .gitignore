@@ -11,8 +11,7 @@ dist/
 *.wasm
 *.wasm.map
 interp/build/
-web/src/wasm/interp.js
-web/src/wasm/interp.wasm
+web/src/wasm/
 
 # sqlite data
 server/data/*.sqlite

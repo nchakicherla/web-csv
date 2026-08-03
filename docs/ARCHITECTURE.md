@@ -96,9 +96,14 @@ exported entry point down to that async import - for `gpu_sum` that's
 chain, not just the leaf trampoline. `interp/ext/Makefile` currently
 builds with `ASYNCIFY=1` (instrument everything - correct, but pays
 size/speed cost on functions that never touch that path, like the scanner
-or grammar loader). The comment there explains how to narrow it to
-`ASYNCIFY_ONLY` once this actually builds: get the real function list from
-`emcc ... -s ASYNCIFY_ADVISE=1` rather than guessing it by hand.
+or grammar loader). This now builds and has been confirmed (Node, with a
+fake `navigator.gpu` and a stub bridge with a real `setTimeout` delay) to
+actually suspend and resume the C call stack correctly across a real async
+JS boundary - so narrowing to `ASYNCIFY_ONLY` is a real, doable
+optimization now, not a hopeful TODO: get the exact function list from
+`emcc ... -s ASYNCIFY_ADVISE=1` against this build rather than guessing it
+by hand. Not done here since `ASYNCIFY=1` is already correct and this
+wasn't the ask.
 
 ## GPU shader library scope
 
@@ -152,16 +157,24 @@ to happen before this is exposed anywhere beyond localhost.
 
 ## What's actually verified vs. not
 
-Verified by a real (native `cc`, not `emcc`) build during scaffolding:
-grammar parsing, the native-function hook, the column store, and
-`col`/`sum`/`filter_gt`/`emit` all work correctly together end to end
-(`filter_gt(col("amount"), 100)` then `sum` on sample data returned the
-hand-checked correct value). See git history / PR description for the
-transcript.
+Verified by a native `cc` build during initial scaffolding (standing in
+for `emcc`, which wasn't installed yet): grammar parsing, the
+native-function hook, the column store, and `col`/`sum`/`filter_gt`/`emit`
+all work correctly together end to end.
 
-**Not verified** (no `emcc`, no browser with WebGPU, no Node in the
-sandbox this was scaffolded in): the actual Emscripten build succeeding,
-Asyncify's unwind/rewind around `wcGpuReduceSum`, the WGSL shader
-compiling and running correctly, and the server actually starting.
-Treat the WASM build, the GPU path, and the server as needing a first
-real run-through, not as proven - see README's "First build checklist".
+Verified since, against a real `emcc` 6.0.5 (`ASYNCIFY=1`) build run under
+Node: `wc_init`/`wc_load_column_f64`/`wc_run` all work against the actual
+build output, and - by faking `navigator.gpu` and a stub async bridge with
+a real `setTimeout` delay to force `gpu_sum`'s GPU-eligible branch -
+Asyncify genuinely suspends the C call stack (`wc_run` → `evalCall` → ...
+→ `wcGpuReduceSum`) across a real async JS boundary and resumes with the
+correct result. `EXPORTED_RUNTIME_METHODS` needed `HEAPF64` added
+explicitly (this Emscripten version doesn't expose typed-array heap views
+by default) - fixed in `interp/ext/Makefile`.
+
+**Still not verified** (no browser with WebGPU available while doing
+this): the WGSL shader (`reduce_sum.wgsl`) and the `GPUDevice`/`GPUBuffer`
+code in `bridge.js` actually running correctly - Node has no WebGPU, so
+the check above only proves Asyncify's mechanics, not the shader itself -
+and the server (`server/`) actually starting. See README's "First build
+checklist" for what to run to close these out.

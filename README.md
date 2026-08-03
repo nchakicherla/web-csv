@@ -13,6 +13,13 @@ built vs. stubbed, and known gaps. This is a scaffold from an initial
 design pass, not a finished app - see "First build checklist" below for
 what's proven to work vs. still untested.
 
+**Status:** builds cleanly against real Emscripten (`emcc` 6.0.5) and runs
+correctly under Node, including a forced-GPU-path check that confirms
+Asyncify genuinely suspends and resumes the C call stack around a real
+async JS boundary. Not yet run in an actual browser, so the WebGPU/WGSL
+path itself (`web/src/gpu/bridge.js`, `reduce_sum.wgsl`) and the server
+are still unverified - see the checklist.
+
 ## Layout
 
 ```
@@ -27,12 +34,12 @@ docs/                  architecture notes
 
 ## Prerequisites
 
-Not installed in the sandbox this scaffold was written in - none of the
-build/run steps below have been executed for real. See "First build
-checklist".
-
-- **Emscripten SDK** (`emcc`) - https://emscripten.org/docs/getting_started/downloads.html
-- **Node.js** (for `server/`) - any reasonably recent LTS
+- **Emscripten SDK** (`emcc`) - https://emscripten.org/docs/getting_started/downloads.html.
+  Installed via `emsdk` (`git clone https://github.com/emscripten-core/emsdk`,
+  `./emsdk install latest && ./emsdk activate latest`), not Homebrew -
+  `source /path/to/emsdk/emsdk_env.sh` before building.
+- **Node.js** (for `server/`, and it's what `emsdk` itself bundles) - any
+  reasonably recent version
 - A browser with WebGPU (recent Chrome/Edge; Firefox/Safari support is
   still landing) to exercise the `gpu_sum` path - everything else works
   without it, falling back to CPU
@@ -63,21 +70,35 @@ you don't need saved queries/dashboards yet.
 
 ## First build checklist
 
-Verified during scaffolding, with a native (`cc`, not `emcc`) build
-standing in for the interpreter core: grammar parsing, the native-function
-hook, the column store, and `col()`/`sum()`/`filter_gt()`/`emit()` all
-work correctly together.
+Verified:
 
-Not yet verified - do these first, in roughly this order, since each
-depends on the last:
+1. ✅ Grammar parsing, the native-function hook, the column store, and
+   `col()`/`sum()`/`filter_gt()`/`emit()` all work correctly together
+   (native `cc` build, standing in for the interpreter core, during initial
+   scaffolding).
+2. ✅ `cd interp/ext && make` succeeds against real `emcc` 6.0.5 with
+   `ASYNCIFY=1`, producing `web/src/wasm/interp.{js,wasm,data}`.
+   `EXPORTED_RUNTIME_METHODS` needs `HEAPF64` explicitly (this Emscripten
+   version doesn't expose it by default) - already fixed in the Makefile,
+   noted here in case an older/newer `emcc` behaves differently.
+3. ✅ `wc_init`/`wc_load_column_f64`/`wc_run` all work under Node against
+   the real build output (`node` from the `emsdk` install works fine for
+   this, no browser needed for the non-GPU path). A forced-GPU-path check
+   (fake `navigator.gpu` + a stub async bridge with a real `setTimeout`
+   delay) confirmed Asyncify actually suspends the C call stack
+   (`wc_run` → `evalCall` → ... → `wcGpuReduceSum`) across a real async JS
+   boundary and resumes with the correct result, not just that the build
+   didn't error.
 
-1. `cd interp/ext && make` actually succeeds against real `emcc`/Asyncify
-2. `wc_init`/`wc_run` work from a browser console against the built `.js`/`.wasm`
-3. `gpu_sum` actually round-trips through `reduce_sum.wgsl` on real WebGPU
-   hardware (`web/src/gpu/bridge.js`) - if this hangs or errors, check
-   Asyncify is instrumenting the full call path first (see
-   ARCHITECTURE.md's Asyncify section) before suspecting the shader
-4. `cd server && npm install && npm start` - dependency versions in
+Not yet verified:
+
+4. `gpu_sum` actually round-trips through `reduce_sum.wgsl` on real WebGPU
+   hardware in a real browser (`web/src/gpu/bridge.js`) - Node has no
+   WebGPU, so this only confirms Asyncify's mechanics (#3 above), not the
+   shader or `GPUDevice`/`GPUBuffer` code actually working. If this hangs
+   or errors in-browser, Asyncify itself is now a known-good starting
+   assumption - look at the shader/bridge code first.
+5. `cd server && npm install && npm start` - dependency versions in
    `package.json` are unverified against current npm
 
 ## Known gaps

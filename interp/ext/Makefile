@@ -29,8 +29,11 @@ CFLAGS = -Wall -Wextra -std=c11 -I$(VENDOR_SRC) -I$(EXT_SRC) -O2
 EXPORTED_FUNCS = \
   _wc_init,_wc_load_column_f64,_wc_run,_wc_reset_session,_malloc,_free
 
+# HEAPF64 has to be listed explicitly - main.js/loadColumn's
+# wasmModule.HEAPF64.set(...) (and bridge.js's read of it) would otherwise
+# be undefined, since typed-array heap views aren't exported by default.
 EXPORTED_RUNTIME = \
-  ccall,cwrap,FS
+  ccall,cwrap,FS,HEAPF64
 
 # ASYNCIFY note: gpu_sum() (builtins_gpu.c) reaches an EM_ASYNC_JS import
 # (wcGpuReduceSum), so every function on the call path from wc_run() down
