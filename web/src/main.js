@@ -64,16 +64,29 @@ function loadF64Column(name, values) {
 }
 
 // '\x1f'-joined, matching wc_load_column_str_dict's expectation (see
-// web_main.c and column.c's columnCreateStrDict) - ccall's 'string' arg
-// type handles the UTF8 encoding itself, no manual malloc needed here.
+// web_main.c and column.c's columnCreateStrDict). The joined string is
+// allocated on the heap explicitly rather than passed as a ccall 'string'
+// argument: ccall's automatic string marshaling allocates on Emscripten's
+// *stack* (a fixed, small default - 64KB), which corrupts memory instead
+// of erroring cleanly once a column's every-row-value string gets large.
+// A 100k-row column reliably crashed with "memory access out of bounds"
+// before this fix - see interp/ext/Makefile's EXPORTED_RUNTIME comment.
 function loadStringColumn(name, values) {
-	const rc = wasmModule.ccall(
-		'wc_load_column_str_dict', 'number',
-		['string', 'string', 'number'],
-		[name, values.join('\x1f'), values.length],
-	);
-	if (rc !== 0) {
-		throw new Error(`failed to load column "${name}" (code ${rc})`);
+	const joined = values.join('\x1f');
+	const byteLen = wasmModule.lengthBytesUTF8(joined) + 1;
+	const ptr = wasmModule._malloc(byteLen);
+	try {
+		wasmModule.stringToUTF8(joined, ptr, byteLen);
+		const rc = wasmModule.ccall(
+			'wc_load_column_str_dict', 'number',
+			['string', 'number', 'number'],
+			[name, ptr, values.length],
+		);
+		if (rc !== 0) {
+			throw new Error(`failed to load column "${name}" (code ${rc})`);
+		}
+	} finally {
+		wasmModule._free(ptr);
 	}
 }
 

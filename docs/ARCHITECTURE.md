@@ -228,7 +228,8 @@ worth reading once before the sections below.
 ```
 web/                      the browser app — no build step, plain ES modules
   index.html               the page itself
-  sample-data/             transactions.csv, for trying things out
+  sample-data/             transactions.csv (20 rows) and
+                           transactions-large.csv (100k, generate.mjs)
   src/
     csv/parse.js            CSV text -> typed columns          (§5)
     csv/parse.test.js        its unit tests
@@ -687,7 +688,14 @@ boundary — not merely that the build didn't error.
 
 **The real GPU path**, in a browser with a real WebGPU adapter: a column
 pushed past the 50,000 threshold round-tripped through `reduce_sum.wgsl`
-on a real `GPUDevice`/`GPUBuffer` and returned the exact correct sum.
+on a real `GPUDevice`/`GPUBuffer`. The first such test used uniform data
+(all 1s) that happens to sum exactly in both f32 and f64, so it confirmed
+the dispatch but not the precision tradeoff (§8) at all. A later run
+against 100,000 rows of realistic, varied amounts (README's "A larger
+CSV") showed the expected f32 drift directly: `gpu_sum` returned a value
+close to but genuinely different from the exact f64 CPU sum — the correct
+outcome, not a bug, and better confirmation than an exact match would have
+been that the real shader ran rather than a fallback.
 
 **The full UI**, in a real browser: CSV upload through the actual file
 input, queries returning hand-checked values, each result shape rendering
@@ -699,11 +707,20 @@ through the real persistence API.
 **The server**: `npm install && npm start`, both API routes round-tripping
 through a real SQLite file, with per-user isolation confirmed.
 
-Getting there surfaced four real bugs, all fixed and documented in the
+Getting there surfaced five real bugs, all fixed and documented in the
 README's "Bugs found": a missing `HEAPF64` export, `MODULARIZE=1` emitting
 a CommonJS factory instead of an ES module, the preloaded grammar file
 404ing against the wrong base URL, and the API client never sending the
-auth header the server required.
+auth header the server required — all four caught the first time any real
+browser run was attempted, at any data size, since they were wiring bugs
+rather than size-dependent ones. The fifth was different in kind: `ccall`'s
+automatic string marshaling silently corrupting memory for a large
+categorical column (it allocates on Emscripten's small, fixed stack rather
+than the heap) only showed up once a realistic 100,000-row CSV was tried -
+the original 20-row sample's short joined strings never got close to the
+stack limit. See README's "A larger CSV" section for exactly why that file
+exists, and the general lesson: a fixed small sample dataset can hide a
+whole class of bug that only a real, sized dataset would ever surface.
 
 ### Automated regression coverage
 

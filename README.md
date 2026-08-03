@@ -113,6 +113,65 @@ query in the textbox as-is:
 
 All hand-checked and matching what a real browser run actually returned.
 
+### A larger CSV, to actually exercise the GPU path
+
+The 20-row file above can't clear `WC_GPU_MIN_LEN` (50,000 - see
+ARCHITECTURE.md's eligibility gate), so `gpu_sum` always takes the CPU
+fallback against it - same correct answer, but the WGSL shader never
+actually runs.
+[web/sample-data/transactions-large.csv](web/sample-data/transactions-large.csv) -
+100,000 rows, `id`/`date`/`month`/`category`/`region`/`channel`/`quantity`/`amount` -
+is big enough to force the real dispatch. It's generated
+deterministically by
+[web/sample-data/generate.mjs](web/sample-data/generate.mjs) (fixed-seed
+PRNG, so regenerating it reproduces the exact same file byte for byte);
+regenerate or resize it with `node generate.mjs <rows> <outfile>`.
+
+Upload it and run:
+
+```
+emit(sum(col("amount")));
+emit(gpu_sum(col("amount")));
+groupby(col("category"), col("amount"), "sum");
+groupby(col("month"));
+```
+
+Expected, verified two independent ways (a plain-JS reduce over the raw
+CSV, and the real interpreter under Node) before ever touching a browser,
+then confirmed a third way in the real browser:
+
+- `sum(col("amount"))` -> **`26559531.42`** (exact - the CPU path stays f64)
+- `gpu_sum(col("amount"))` -> **a close but *different* number** (in one
+  real run, `26559531.3515625`) - and that's correct, not a bug: past the
+  threshold this genuinely dispatches through `reduce_sum.wgsl` on the
+  GPU, which sums in f32 (WGSL has no f64 - see ARCHITECTURE.md §8), so
+  a little drift on a sum this large is expected. If it ever comes back
+  bit-identical to the CPU sum, that's the more suspicious result - it'd
+  suggest the CPU fallback silently ran instead.
+- `groupby(col("category"), col("amount"), "sum")` -> `{coffee: 188033.92,
+  groceries: 3433538.13, utilities: 2156688.61, dining: 1158195.76,
+  transport: 676631.37, electronics: 9594373.57, rent: 3451725.51,
+  travel: 5900344.55}`
+- `groupby(col("month"))` -> 12 groups, `jan`..`dec` in that order (the
+  generator writes rows chronologically, and dictionary order is
+  first-seen order - see ARCHITECTURE.md §5), each ~8,333 (100,000 / 12)
+
+**A real bug turned up building this file** - large enough data to be
+worth recording. Loading `transactions-large.csv` through the UI crashed
+with `RuntimeError: memory access out of bounds` while loading the
+categorical columns. Cause: `main.js`'s `loadStringColumn` passed the
+whole joined-values string as a `ccall` `'string'`-typed argument, which
+Emscripten marshals through a *stack* allocation (a fixed, small default -
+64KB) rather than the heap - fine for the 20-row file's short strings,
+silent memory corruption once a column's every-row-value string reaches
+the hundreds of KB a 100k-row column produces. Fixed by allocating that
+one argument on the heap explicitly (`_malloc` + `stringToUTF8`, both now
+in `interp/ext/Makefile`'s `EXPORTED_RUNTIME_METHODS`) instead of relying
+on `ccall`'s automatic string marshaling. Covered by a new regression test
+in `interp/ext/test/wasm_smoke.test.mjs` (a 60,000-row categorical column,
+well past the 64KB stack) so a regression back to the `ccall` shortcut
+fails a test instead of a real upload.
+
 ## Testing
 
 ```bash
@@ -202,6 +261,13 @@ with real WebGPU hardware:
    back from the saved-dashboards dropdown, and running it again all
    round-tripped correctly through the real persistence API - same
    `8183.23`/`8512.01`/per-category values every time.
+10. ✅ A 100,000-row CSV (`sample-data/transactions-large.csv`) loads and
+    queries correctly - large enough to actually clear `WC_GPU_MIN_LEN`
+    and force `gpu_sum` through the real GPU dispatch rather than the CPU
+    fallback, confirmed by its result genuinely differing from the exact
+    CPU sum (real f32 rounding drift - see "A larger CSV" above). Every
+    value cross-checked against an independent plain-JS computation over
+    the raw file before ever touching the interpreter.
 
 ### Bugs found doing the above (all fixed)
 
@@ -223,6 +289,14 @@ with real WebGPU hardware:
   stub auth - the UI's "Save query" button was silently broken. Fixed by
   generating a stable per-browser dev identity (`localStorage`) and
   sending it on every request; see `client.js`'s `getDevUserId`.
+- `main.js`'s `loadStringColumn` passed a whole column's joined values as
+  a `ccall` `'string'`-typed argument, which Emscripten marshals through a
+  *stack* allocation (a fixed, small default - 64KB) rather than the heap.
+  Fine at 20 rows; a 100,000-row categorical column's joined string is
+  megabytes, and reliably crashed with `RuntimeError: memory access out of
+  bounds` - real memory corruption, not a clean error. Fixed by allocating
+  that argument on the heap explicitly (`_malloc` + `stringToUTF8`) instead
+  of relying on `ccall`'s automatic marshaling; see "A larger CSV" above.
 
 ## Known gaps
 

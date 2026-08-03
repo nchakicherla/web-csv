@@ -35,8 +35,16 @@ EXPORTED_FUNCS = \
 # be undefined, since typed-array heap views aren't exported by default.
 # UTF8ToString is what wcEmitGroups (builtins_gpu.c's groupby output path)
 # uses to decode the '\x1f'-joined label string it gets back.
+# lengthBytesUTF8/stringToUTF8: wc_load_column_str_dict's joined-values
+# argument can be large (every row's value, for the whole column) - ccall's
+# automatic 'string' marshaling allocates on Emscripten's *stack* (default
+# 64KB), which silently corrupts memory past that size instead of erroring
+# cleanly. main.js allocates that one argument on the heap explicitly with
+# these instead of passing it as a ccall 'string' type - see main.js's
+# loadStringColumn for the real crash this fixes (a 100k-row categorical
+# column reliably segfaulted before this).
 EXPORTED_RUNTIME = \
-  ccall,cwrap,FS,HEAPF64,UTF8ToString
+  ccall,cwrap,FS,HEAPF64,UTF8ToString,lengthBytesUTF8,stringToUTF8
 
 # ASYNCIFY note: gpu_sum() (builtins_gpu.c) reaches an EM_ASYNC_JS import
 # (wcGpuReduceSum), so every function on the call path from wc_run() down

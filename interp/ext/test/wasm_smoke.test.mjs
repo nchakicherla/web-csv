@@ -108,4 +108,42 @@ test('wasm build smoke test', { skip: built ? false : 'run `make` in interp/ext/
 		assert.ok(elapsed >= 45, `expected the real ~50ms bridge delay to be observed (got ${elapsed}ms) - if this is fast, Asyncify may not be suspending the call stack`);
 		assert.equal(mod.wcResults[0], n);
 	});
+
+	await t.test('a large categorical column loads without corrupting memory', async () => {
+		// Regression test: wc_load_column_str_dict's joined-values argument
+		// used to be passed as a ccall 'string' type, which Emscripten
+		// marshals through a stack allocation (a fixed, small default -
+		// 64KB) rather than the heap. A 100k-row categorical column's
+		// joined string is comfortably megabytes, and reliably crashed with
+		// "memory access out of bounds" - not a clean JS exception, actual
+		// memory corruption - before main.js/loadStringColumn switched to
+		// an explicit _malloc + stringToUTF8 heap allocation. This
+		// reproduces that scale (60k rows, well past the 64KB stack) using
+		// the same fixed pattern, so a regression back to the ccall
+		// 'string' shortcut would crash this test the same way it crashed
+		// a real 100k-row CSV upload.
+		const mod = await createInterpModule({ locateFile });
+		const rc1 = mod.ccall('wc_init', 'number', ['string'], ['/resources/grammar-csv.txt']);
+		assert.equal(rc1, 0);
+
+		const n = 60000;
+		const cats = ['north', 'south', 'east', 'west'];
+		const values = Array.from({ length: n }, (_, i) => cats[i % cats.length]);
+		const joined = values.join('\x1f');
+
+		const byteLen = mod.lengthBytesUTF8(joined) + 1;
+		const ptr = mod._malloc(byteLen);
+		mod.stringToUTF8(joined, ptr, byteLen);
+		const rc2 = mod.ccall('wc_load_column_str_dict', 'number', ['string', 'number', 'number'], ['region', ptr, n]);
+		mod._free(ptr);
+		assert.equal(rc2, 0);
+
+		mod.wcResults = [];
+		const run = mod.cwrap('wc_run', 'number', ['string'], { async: true });
+		const rc3 = await run('groupby(col("region"));');
+		assert.equal(rc3, 0);
+		assert.deepEqual(mod.wcResults[0].labels, cats);
+		// n=60000 split evenly across 4 categories by i % 4.
+		assert.deepEqual(mod.wcResults[0].values, [15000, 15000, 15000, 15000]);
+	});
 });
