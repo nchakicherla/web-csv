@@ -13,10 +13,16 @@ saved as a dashboard tile, assembled with others, and persisted. A small
 Node/SQLite service persists saved queries and dashboards; the compute
 path itself needs no backend.
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design, what's
-built vs. stubbed, and known gaps. This is a scaffold from an initial
-design pass, not a finished app - see "First build checklist" below for
-what's proven to work vs. still untested.
+**New here?** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains how the
+whole thing works from the data model up, assuming a data-analysis
+background rather than a compilers/GPU one - including a worked
+walkthrough of one query through every layer, why columnar storage and
+dictionary encoding matter, and a suggested reading order through the
+code. It also carries the design rationale, the tradeoffs, and what's
+verified vs. not.
+
+This is a proof of concept, not a finished app - see "First build
+checklist" below for what's proven to work.
 
 **Status:** builds against real Emscripten (`emcc` 6.0.5) and has been run
 end to end in a real browser with real WebGPU hardware - CSV upload

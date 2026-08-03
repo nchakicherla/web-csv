@@ -1,307 +1,758 @@
 # Architecture
 
-CSV analysis in the browser: repl2's configurable-grammar tree-walking
-interpreter (compiled to WASM via Emscripten) as both query language and
-scripting language, with WebGPU compute shaders taking the parallelizable
-parts of the work on eligible hardware. A small Node/SQLite service
-persists saved queries and dashboards; everything else runs client-side.
+This document explains how web-csv works, from the data model up. It is
+written to be readable if you know data analysis (spreadsheets, pandas,
+SQL) but not compilers, WebAssembly, or GPU programming — the jargon those
+layers need is introduced as it comes up, and §2 is a glossary you can
+jump back to.
 
-## Layers
+**Contents**
+
+1. [What this is, and why it's shaped this way](#1-what-this-is-and-why-its-shaped-this-way)
+2. [Vocabulary](#2-vocabulary)
+3. [One query, end to end](#3-one-query-end-to-end)
+4. [Layers (file map)](#4-layers-file-map)
+5. [The column store — the shared data model](#5-the-column-store--the-shared-data-model)
+6. [The interpreter — how text becomes a running query](#6-the-interpreter--how-text-becomes-a-running-query)
+7. [The builtin bridge — where the interpreter meets the data](#7-the-builtin-bridge--where-the-interpreter-meets-the-data)
+8. [The GPU path](#8-the-gpu-path)
+9. [Charts and the dashboard](#9-charts-and-the-dashboard)
+10. [The server](#10-the-server)
+11. [Design decisions and tradeoffs](#11-design-decisions-and-tradeoffs)
+12. [What's actually verified vs. not](#12-whats-actually-verified-vs-not)
+13. [Suggested reading order in the code](#13-suggested-reading-order-in-the-code)
+
+---
+
+## 1. What this is, and why it's shaped this way
+
+You upload a CSV, type a query, and get numbers and charts back. That
+much is ordinary. Three things underneath are not:
+
+**Everything computes in your browser.** There is no "upload your data to
+our servers" step — the CSV is read by JavaScript, handed to an analysis
+engine compiled into the page, and never leaves your machine. The small
+server in `server/` exists only to remember saved queries and dashboard
+layouts; unplug it and the analysis still works.
+
+**The query language is a swappable file, not compiled-in code.** The
+thing that reads `groupby(col("category"), col("amount"), "sum")` and
+turns it into a parse tree is driven by
+[`resources/grammar-csv.txt`](../resources/grammar-csv.txt) — a plain text
+file of grammar rules. Point the engine at a different grammar file and it
+parses a differently-shaped language, with no recompile. That is the
+feature the vendored [repl2](https://github.com/nchakicherla/repl2)
+interpreter brings; a hand-written query parser would not have it.
+
+**Heavy numeric work can run on the GPU.** Summing a large column
+dispatches a *compute shader* — a small program that runs on thousands of
+GPU threads at once — instead of a serial loop, when the hardware supports
+it and the column is big enough to be worth it.
+
+### How this compares to tools you already know
+
+Be clear-eyed about this: **web-csv is a proof of concept, not a
+competitor to pandas or DuckDB.** Those are mature, heavily optimized, and
+support hundreds of operations; this supports six. What it offers instead:
+
+| | pandas / DuckDB | web-csv |
+|---|---|---|
+| Where it runs | your machine, via Python/CLI | the browser tab, no install |
+| Data leaves your machine? | no | no |
+| Query language | fixed (pandas API / SQL) | **defined by a swappable grammar file** |
+| Operations | hundreds | six (`col`, `sum`, `gpu_sum`, `filter_gt`, `groupby`, `emit`) |
+| GPU acceleration | rarely / via extensions | built into the eligibility path |
+
+The genuinely useful thing about reading this codebase is that it is a
+*small* analytics engine with nothing hidden. pandas and DuckDB do
+everything described in §5 and §7 — columnar storage, dictionary encoding,
+grouped aggregation — but behind hundreds of thousands of lines. Here each
+of those is a few dozen lines of C you can read in an afternoon.
+
+---
+
+## 2. Vocabulary
+
+Terms this document uses that a data-analysis background wouldn't
+necessarily cover. Skim now, refer back later.
+
+**Columnar (column-oriented) storage** — storing a table as one array per
+*column* rather than one record per *row*. See §5; this is the single most
+important idea in the codebase.
+
+**Dictionary encoding** — storing repeated text as small integer codes
+plus one lookup table of the distinct values. pandas calls this a
+`Categorical`; Parquet calls it a dictionary page. See §5.
+
+**f64 / f32 / i32** — a 64-bit float ("double precision", what
+spreadsheets and pandas use by default), a 32-bit float (half the
+precision), and a 32-bit integer. The f64-vs-f32 distinction matters in
+§8.
+
+**WebAssembly (WASM)** — a binary instruction format browsers can run at
+near-native speed. It lets code written in C (like this project's
+interpreter) run in a web page instead of being rewritten in JavaScript.
+
+**Emscripten / `emcc`** — the toolchain that compiles C to WebAssembly and
+generates the JavaScript "glue" that loads it and lets JS call into it.
+
+**Interpreter / tree-walking interpreter** — a program that runs source
+code directly, rather than compiling it to machine code first. A
+*tree-walking* one runs the program by recursively walking its parse tree.
+See §6.
+
+**Grammar / token / AST** — a grammar is the set of rules describing a
+language's syntax; a token is one lexical atom (`groupby`, `(`, `"sum"`);
+an AST (abstract syntax tree) is the tree those tokens parse into. See §6.
+
+**Compute shader** — a program that runs on the GPU for general
+computation rather than drawing graphics. **WebGPU** is the browser API
+that dispatches them; **WGSL** is the language they're written in.
+
+**Reduction** — collapsing many values into one (a sum, a min, a max).
+"Parallel reduction" is the standard GPU technique for doing that with
+many threads. See §8.
+
+**Asyncify** — an Emscripten feature that lets compiled C code pause
+mid-call, wait on a JavaScript promise, and resume. See §7.
+
+**Arena allocation** — a memory strategy where many allocations come from
+one big block that is freed all at once, instead of being freed
+individually. repl2 uses one for parse trees.
+
+---
+
+## 3. One query, end to end
+
+The fastest way to understand the system is to follow a single query
+through every layer. Take this, typed into the query box:
 
 ```
-web/               browser UI, CSV parsing, WebGPU bridge, static JS
-  index.html
+groupby(col("category"), col("amount"), "sum");
+```
+
+### Step 0 — loading the CSV (happens first, once)
+
+[`web/src/csv/parse.js`](../web/src/csv/parse.js) splits the file text
+into lines and fields, then decides each column's type: if every value in
+a column is numeric or empty, it's `f64`; otherwise it's `string`.
+
+[`web/src/main.js`](../web/src/main.js) then pushes each column into the
+WASM engine's memory — `wc_load_column_f64` for numbers,
+`wc_load_column_str_dict` for text. Those live in the *column store* (§5)
+under their CSV header name, which is what `col("category")` will look up.
+
+### Step 1 — JS asks the engine to run the text
+
+`main.js`'s `runQuery()` empties `Module.wcResults` (the array results get
+pushed onto) and calls the exported C function `wc_run` with the query
+string.
+
+### Step 2 — text becomes a tree
+
+`wc_run` ([`interp/ext/web_main.c`](../interp/ext/web_main.c)) hands the
+string to repl2's parser. The scanner splits it into tokens using the
+vocabulary the grammar file declared, and the parser builds an AST —
+roughly:
+
+```
+FNCALL "groupby"
+├── FNCALL "col"  └── STRLIT "category"
+├── FNCALL "col"  └── STRLIT "amount"
+└── STRLIT "sum"
+```
+
+### Step 3 — the tree gets walked
+
+`interpExecEcho` walks that tree. Reaching the `groupby` call node it
+calls `evalCall` ([`interp.c`](../interp/vendor/repl2/src/interp.c)),
+which evaluates the arguments left to right first. Each `col(...)` is
+itself a call, so this recurses: `doCol` looks the name up in the column
+store and returns a handle to that column.
+
+### Step 4 — a native function does the actual work
+
+`evalCall` doesn't know what `groupby` means. It offers the name to a
+*native hook* — a C callback this project registered — which routes it to
+`doGroupby` in
+[`builtins_gpu.c`](../interp/ext/builtins_gpu.c) (§7).
+
+`doGroupby` validates its arguments, then makes **one pass over the rows**.
+For each row it reads the category's integer code and uses it as an index
+into per-group accumulator arrays:
+
+```c
+for (i = 0; i < len; i++) {
+    int32_t code = codes[i];
+    if (code < 0 || (uint32_t)code >= n_groups) continue;
+
+    counts[code]++;                 /* always — this alone answers "count" */
+    if (values) {                   /* NULL in the 1-arg count-only form   */
+        sums[code] += values[i];
+        if (values[i] < mins[code]) mins[code] = values[i];
+        if (values[i] > maxs[code]) maxs[code] = values[i];
+    }
+}
+```
+
+That's the whole grouped-aggregation algorithm. Note that it accumulates
+*all* the aggregates in the single pass and picks the requested one
+afterward — cheaper than branching on `agg` per row. `avg` is then just
+`sums[g] / counts[g]`.
+
+It works with no sorting and no hash lookups *because* the category column
+is dictionary-encoded — the code **is** the array index. This is the
+payoff of the storage decision in §5.
+
+### Step 5 — the result crosses back into JavaScript
+
+A grouped result is two parallel arrays: group labels and one aggregate
+per group. It's shipped back by `wcEmitGroups`, which decodes the labels
+and pushes `{type: 'groups', agg: 'sum', labels: [...], values: [...]}`
+onto `Module.wcResults`.
+
+### Step 6 — the shape picks the chart
+
+`wc_run` returns; `runQuery` hands `wcResults` to `renderResults`
+([`charts/render.js`](../web/src/charts/render.js)), which dispatches on
+each result's *shape*: a `groups` object becomes a bar chart, a bare
+number becomes a stat tile, a whole column becomes a table (§9).
+
+**Every layer in this project appears in that path**, which is why it's
+worth reading once before the sections below.
+
+---
+
+## 4. Layers (file map)
+
+```
+web/                      the browser app — no build step, plain ES modules
+  index.html               the page itself
+  sample-data/             transactions.csv, for trying things out
   src/
-    csv/parse.js        CSV text -> typed columns
-    gpu/device.js        shared WebGPU device
-    gpu/bridge.js         Module.gpuBridge - the JS side of the async boundary
-    gpu/shaders/*.wgsl    compute shaders
-    api/client.js         talks to server/
-    charts/                bar chart / stat tile / table renderers + theme.css
-    dashboard.js            tile add/remove/run/save/load
-    main.js               wires it all together
-    wasm/                 emcc build output (gitignored, not committed)
+    csv/parse.js            CSV text -> typed columns          (§5)
+    csv/parse.test.js        its unit tests
+    gpu/device.js           one shared WebGPU device           (§8)
+    gpu/bridge.js            the JS half of the async boundary (§7, §8)
+    gpu/shaders/*.wgsl       the compute shaders               (§8)
+    charts/render.js        picks a chart form by result shape (§9)
+    charts/bar.js            SVG bar chart
+    charts/stat.js           stat tile
+    charts/table.js          table + every chart's table view
+    charts/format.js         number formatting (+ .test.js)
+    charts/theme.css         color/spacing tokens, light + dark
+    dashboard.js            tile add/remove/run/save/load       (§9)
+    api/client.js           talks to server/                    (§10)
+    main.js                 wires it all together
+    wasm/                   emcc build output (gitignored)
 
-interp/
-  vendor/repl2/src/   vendored repl2 core (see vendor/VENDORED.md) + one
-                       small patch: a native-function hook in interp.c/.h
-  ext/                web-csv's own C layer, compiled alongside the vendor
-                       tree by ext/Makefile
-    column.h/.c          typed column type (f64 / i32 / dict-encoded string)
-    store.h/.c            the session's named + tracked columns
-    builtins_gpu.h/.c     col()/sum()/gpu_sum()/filter_gt()/groupby()/
-                          emit() - the native-function hook implementation
-    web_main.c            Emscripten entry point (wc_init/wc_run/...)
+interp/                   the analysis engine, written in C
+  vendor/repl2/src/         vendored repl2 interpreter          (§6)
+                             + one local patch (VENDORED.md)
+  ext/                      web-csv's own C layer
+    column.h/.c              the column type                    (§5)
+    store.h/.c               the session's live columns         (§5)
+    builtins_gpu.h/.c        col/sum/gpu_sum/filter_gt/
+                             groupby/emit                       (§7)
+    web_main.c               entry points JS calls (wc_run, …)
+    Makefile                 the emcc build
+    test/                    native C tests + a WASM smoke test  (§12)
 
-server/             persistence API (saved queries, dashboards) + serves web/
-  src/index.js, db.js, routes/
+server/                   persistence only — never runs a query (§10)
+  src/app.js, index.js, db.js, routes/
+  test/api.test.js
 
-resources/
-  grammar-csv.txt    default DSL grammar
-
-docs/ARCHITECTURE.md  this file
+resources/grammar-csv.txt the query language's grammar          (§6)
+Makefile                  `make test` runs every suite          (§12)
 ```
 
-## Column store — the shared contract
+---
 
-A CSV column becomes one typed, contiguous buffer: `Float64Array`-shaped
-for numeric columns, dictionary-encoded `int32` codes for
-strings/categoricals. This is the one representation all three layers
-(interpreter, CPU builtins, GPU bridge) read and write against - no boxing
-per row, no copying between "the interpreter's view" and "the GPU's view".
+## 5. The column store — the shared data model
 
-Columns are `malloc`/`free`'d (interp/ext/column.c), not arena-allocated:
-their lifetime is "until the CSV is unloaded or a result is replaced",
-independent of any one script run's arena. The interpreter wraps a
-`Column*` as an `Object` via `PTR_TYPE` plus a magic-number tag
-(`objColumn`/`objAsColumn`) so a native builtin can accept a column
-argument without repl2's `object.h` needing to know columns exist.
+### Why columnar
 
-`wc_load_column_str_dict` (web_main.c) is the categorical counterpart to
-`wc_load_column_f64`: it takes a `\x1f`-joined string of raw values (see
-column.h's `columnDictJoined` for why that delimiter - ordinary CSV text
-essentially never contains it) and `columnCreateStrDict` (column.c) builds
-the dictionary itself, assigning each distinct value the next free code in
-first-seen order. That's an O(n * distinct_values) linear scan against the
-dict-so-far, not a hash table - fine for a CSV's worth of categories, a
-reasonable upgrade if a column turns out to be high-cardinality.
+A CSV looks row-oriented on disk:
 
-## Grammar/DSL layer
+```
+id,amount,category
+1,42.50,groceries
+2,199.99,electronics
+```
 
-repl2's interpreter dispatches on a fixed set of built-in `STX_*` tags
-(scope, if, while, fncall, expr, ...) - see `interp/vendor/repl2/src/interp.c`.
-A grammar file only defines *concrete syntax* that produces those tags;
-it can't introduce new runtime semantics on its own. `resources/grammar-csv.txt`
-is one such grammar (`let x := expr;`, no braces required at the top
-level) - swap it for a different grammar file and the same interpreter
-runs a differently-shaped language, which is the feature repl2 brings to
-this project that a hand-rolled query parser wouldn't.
+Store it that way in memory — an array of record objects — and summing
+`amount` means visiting 20 separate objects and pulling one field out of
+each. The values you want are scattered, each behind a pointer, each
+interleaved with data you don't want.
 
-A SQL-shaped surface (`SELECT sum(amount) FROM t WHERE amount > 100`) is a
-plausible grammar to add later, but it needs a new `STX_SELECT` tag *and*
-a corresponding case in `interp.c`'s `execNode`/`evalNode` switch to mean
-anything - repl2 has no macro/desugaring system that would let a grammar
-alone rewrite that into nested `STX_FNCALL`s. That's real interpreter work,
-not just a new grammar file, and isn't attempted in this scaffold.
+Store it *columnar* — one contiguous array per column — and `amount`
+becomes `[42.50, 199.99, …]`, one packed block of doubles. Now summing is
+a tight loop over adjacent memory. That matters for three reasons:
 
-## Builtin bridge (interpreter <-> GPU) + Asyncify scoping
+1. **Cache locality.** CPUs fetch memory in blocks. Adjacent values mean
+   every fetch delivers useful data instead of mostly-unwanted neighbors.
+2. **You only touch the columns you use.** A query over `amount` never
+   reads `category` at all.
+3. **It's the only shape a GPU can use.** A compute shader wants a flat
+   buffer of numbers (§8). A columnar array already *is* one — no
+   conversion step.
 
-`interp/ext/builtins_gpu.c` registers `col`, `sum`, `gpu_sum`, `filter_gt`,
-`groupby`, `emit` through the native-function hook (`interpSetNativeHook`,
-patched into vendored `interp.c`/`interp.h` - see `vendor/VENDORED.md` for
-exactly what changed and why). `sum` is a synchronous CPU loop. `gpu_sum` is the
-one actual async boundary: above `WC_GPU_MIN_LEN` elements, on an f64
-column, when `navigator.gpu` resolves, it calls `wcGpuReduceSum` - an
-`EM_ASYNC_JS` import whose body is `await Module.gpuBridge.reduceSum(...)`
-(`web/src/gpu/bridge.js`) - and falls back to the CPU loop otherwise.
+This is not a web-csv invention: it is why pandas stores DataFrames as
+per-column NumPy arrays, why Parquet is a columnar file format, and why
+DuckDB is a columnar engine. web-csv just does it small enough to read.
 
-Asyncify has to instrument every function on the call path from an
-exported entry point down to that async import - for `gpu_sum` that's
-`wc_run` through `interp.c`'s `evalCall`/`evalNode`/`execNode`/`interpExec`
-chain, not just the leaf trampoline. `interp/ext/Makefile` currently
-builds with `ASYNCIFY=1` (instrument everything - correct, but pays
-size/speed cost on functions that never touch that path, like the scanner
-or grammar loader). This now builds and has been confirmed (Node, with a
-fake `navigator.gpu` and a stub bridge with a real `setTimeout` delay) to
-actually suspend and resume the C call stack correctly across a real async
-JS boundary - so narrowing to `ASYNCIFY_ONLY` is a real, doable
-optimization now, not a hopeful TODO: get the exact function list from
-`emcc ... -s ASYNCIFY_ADVISE=1` against this build rather than guessing it
-by hand. Not done here since `ASYNCIFY=1` is already correct and this
-wasn't the ask.
+### The three column types
 
-`groupby(cat_col, num_col, agg)` (sum/count/avg/min/max), or
-`groupby(cat_col)` alone for a count-only shorthand that doesn't need a
-numeric column at all - is CPU-only, no GPU path yet, see the
-shader-scope note below. (2-arg `groupby` is deliberately rejected rather
-than guessed at: it's genuinely ambiguous whether the second argument was
-meant to be the numeric column with `agg` implied, or the `agg` name with
-the numeric column omitted.) It also doesn't return a value the way
-`sum`/`filter_gt` do: since a grouped result is naturally *two* parallel
-arrays (labels from the categorical column's dictionary, one aggregate
-per group) and the interpreter's `Object` has no type that carries a pair
-like that, `groupby` instead emits its result directly - `wcEmitGroups`,
-an `EM_JS` import that decodes the `\x1f`-joined label string
-(`UTF8ToString(...).split('\x1f')`) and pushes
-`{type:'groups', agg, labels, values}` onto `Module.wcResults`, the same
-array `emit()`'s results land in. That makes `groupby` an output
-operation like `print`/`emit`, not a pure function - `sum(groupby(...))`
-isn't a thing today. A dedicated result type would remove that limit; not
-built here since reusing `emit`'s existing output channel needed nothing
-new either in the interpreter or in `main.js`'s result handling, and
-because that type is better designed once the dashboard UI defines what
-"chartable data" actually needs to look like.
+[`interp/ext/column.h`](../interp/ext/column.h):
 
-`emit()` itself streams a whole column now rather than summarizing it -
-`wcEmitNumberArray` for `COL_F64` (every value, in order), and
-`wcEmitStringArray` for `COL_STR_DICT` (every *row's* value, resolved
-through the dictionary via `columnResolveJoined` - not just the distinct
-dictionary entries `columnDictJoined` would give). Both push
-`{type:'column', dtype, values}`. A caller that wants a single summary
-number still has `sum()`/`groupby()` for that, explicitly - the old
-"a column just gets summed" shortcut `emit()` used to take was more
-surprising than useful once you could ask for the real thing.
+| Type | Holds | Used for |
+|---|---|---|
+| `COL_F64` | `double*` | numeric columns |
+| `COL_I32` | `int32_t*` | integer columns (defined, not yet produced by the CSV path) |
+| `COL_STR_DICT` | `int32_t*` codes + `char**` dictionary | text / categorical columns |
 
-## GPU shader library scope
+### Dictionary encoding, concretely
 
-`web/src/gpu/shaders/reduce_sum.wgsl` - a two-stage parallel reduction
-(per-workgroup partial sums on GPU, final add of the small partials array
-on CPU) - is the only shader in this scaffold. Filter (predicate -> mask)
-is the next straightforward one; a GPU groupby would build on the same
-segmented-reduce idea reduce_sum.wgsl already uses, keyed by category code
-instead of summing everything into one bucket. Sort and hash-join are real
-engineering effort (bitonic sort network, GPU hash join are established
-techniques, not quick additions) and are out of scope here; the CPU path
-covers all of these operations until then.
+The sample CSV's `category` column has 20 rows but only 6 distinct values.
+Storing 20 strings would mean 20 separate allocations and 20 pointer-chases
+per pass. Instead, `columnCreateStrDict` assigns each distinct value a code
+in first-seen order:
 
-**WGSL has no f64.** Its core numeric types are f32/i32/u32. `bridge.js`
-downcasts an f64 column to f32 before upload, which is a real precision
-tradeoff (visible drift possible on large sums or values spanning many
-orders of magnitude), not an oversight - `cpuSum` in `builtins_gpu.c`
-stays exact f64 and is what small/precision-sensitive sums use via the
-eligibility gate below.
+```
+dictionary: ["groceries", "electronics", "coffee", "rent", "utilities", "travel"]
+                  0             1            2        3         4          5
 
-## Eligibility gate
+rows:       groceries  electronics  coffee  rent  groceries  coffee  …
+codes:  →       0            1         2      3       0         2    …
+```
 
-Three conditions, not just "hardware supports WebGPU" (`doSum` in
-builtins_gpu.c):
+The column now holds one flat `int32` array. Three consequences:
 
-1. the operation is a GPU-friendly shape (columnar reduce, not per-row
-   branchy scripting - `gpu_sum` is only wired for `sum`)
-2. the column is above `WC_GPU_MIN_LEN` (currently 50,000, an unbenchmarked
-   starting guess - buffer upload + pipeline dispatch + mapped readback
-   all cost real wall-clock time a plain loop doesn't)
-3. `navigator.gpu` actually resolves an adapter (`wcGpuAvailable`)
+- **It's smaller** — 4 bytes per row instead of a pointer plus the string.
+- **Comparisons are integer comparisons** — no `strcmp` per row.
+- **Grouping is free.** As §3 step 4 showed, the code *is* the accumulator
+  array index. No hash table, no sort. This is exactly why pandas
+  `Categorical` speeds up `groupby`.
 
-Below the threshold, or when any condition fails, `sum()`'s CPU loop runs
-- faster below threshold anyway, and skips Asyncify's overhead for that
-call.
+The cost, honestly: building the dictionary is currently an O(n ×
+distinct) linear scan (each new value is compared against the dictionary
+so far). Fine for tens or hundreds of categories; a hash table would be
+the fix for a high-cardinality column, and isn't built yet.
 
-## Deployment model
+The `\x1f` in `wc_load_column_str_dict` is a plumbing detail: JS can't
+hand C an array of strings directly, so values are joined with ASCII Unit
+Separator (0x1F) — a control character real CSV text essentially never
+contains, so no escaping scheme is needed — and split back apart in C.
 
-WebGPU compute runs client-side, so the heavy lifting happens on the
-user's own hardware - the app itself could be nearly static. This project
-does want persistence (saved queries, saved dashboards, multi-user), so
-`server/` exists for exactly that: a small Express + SQLite service that
-serves `web/` as static files and exposes `/api/queries` and
-`/api/dashboards`. It has no involvement in running a query - a browser
-with the page open and no backend reachable can still load a CSV and run
-scripts against it.
+### Lifetimes and the store
 
-**Open decision, deliberately not resolved here:** `server/src/routes/auth.js`
-is a dev-only stub (trusts an `x-user-id` header, no real login). Real
-auth - sessions vs. OAuth/SSO vs. something else - is a decision with
-tradeoffs that shouldn't get made implicitly by scaffolding code; it needs
-to happen before this is exposed anywhere beyond localhost.
+Columns are `malloc`/`free`'d rather than arena-allocated (§2) because
+their lifetime is "until the CSV is replaced," which doesn't line up with
+any single query run. [`store.c`](../interp/ext/store.c) holds two kinds:
 
-## Dashboard & charts
+- **named** — CSV columns, reachable as `col("amount")`. Loading the same
+  name again frees the old one and replaces it.
+- **tracked** — intermediates a builtin created (e.g. `filter_gt`'s
+  output). Not reachable by name, but owned by the store so they're freed
+  when the session ends instead of leaking.
 
-`web/src/charts/render.js` picks a form by the shape of a `wcResults`
-entry, not by what produced it: a bare number is a stat tile, a `groupby`
-result (`{type:'groups', ...}`) is a bar chart, a whole column
-(`{type:'column', ...}`) is a table - the same dispatch serves both the
-ad-hoc query box's results area and every dashboard tile, since a tile is
-just "a query, run, its results rendered" with nothing dashboard-specific
-about the rendering itself.
+The interpreter carries a column as a generic pointer value tagged with a
+magic number (`objColumn` / `objAsColumn`), which is how a builtin can
+take a column argument without repl2's own value type needing to know
+columns exist.
 
-**No chart library.** `web/` has no build step (plain ES modules), so
-`charts/bar.js` is hand-rolled SVG + DOM rather than a dependency - gridlines,
-rounded-top bars, a hover tooltip, and a table-view toggle, all styled
-through `charts/theme.css`'s CSS custom properties. Colors come from the
-`dataviz` skill's reference palette, chosen by the job the color is doing
-per its `choosing-a-form.md`: every chart here is a single-series magnitude
-comparison (one aggregate value per category), which is a **sequential**
-job (one hue, light→dark), not identity - so bars use one fixed accent
-color (`--series-1`, the documented blue) rather than the 8-hue categorical
-set. That's also why no palette validation run was needed: validation
-(`scripts/validate_palette.js`) checks that *distinct* categorical hues stay
-tell-apart-able under color-vision deficiency, which doesn't apply to a
-chart using exactly one already-vetted color for every bar.
+---
 
-**A dashboard is a named list of tiles**, each just a query source string
-(`web/src/dashboard.js`). Running a tile runs its query against whatever
-CSV is currently loaded and renders every result it produces via
-`renderResults`. Saving persists `{title, source}` pairs through
-`/api/dashboards` (`layout: {tiles: [...]}`) - deliberately not the
-*results*, so a loaded dashboard always reflects whatever CSV is loaded
-when you run it, never a stale snapshot baked in at save time. The
-tradeoff: loading a dashboard without the right CSV loaded first just
-fails the way any query missing its columns would - there's no stored
-data to fall back on.
+## 6. The interpreter — how text becomes a running query
 
-## What's actually verified vs. not
+### The pipeline
 
-Verified by a native `cc` build during initial scaffolding (standing in
-for `emcc`, which wasn't installed yet): grammar parsing, the
-native-function hook, the column store, and `col`/`sum`/`filter_gt`/`emit`
-all work correctly together end to end.
+```
+grammar file ─┐
+              ├─► registry (token vocabulary + rule tree)
+query text  ──┘        │
+                       ▼
+            scanner ─► tokens ─► parser ─► AST ─► tree-walking evaluator
+```
 
-Verified next, against a real `emcc` 6.0.5 (`ASYNCIFY=1`) build run under
-Node: `wc_init`/`wc_load_column_f64`/`wc_run` all work against the actual
-build output, and - by faking `navigator.gpu` and a stub async bridge with
-a real `setTimeout` delay to force `gpu_sum`'s GPU-eligible branch -
-Asyncify genuinely suspends the C call stack (`wc_run` → `evalCall` → ...
-→ `wcGpuReduceSum`) across a real async JS boundary and resumes with the
-correct result.
+**The scanner** turns characters into tokens. What counts as a token is
+not hardcoded — it's built at load time from what the grammar file
+declared, which is why a grammar can introduce syntax (`:=`, `let`) the C
+source has never heard of.
 
-Verified fully since, in a real browser (Chromium/Electron, real WebGPU
-adapter and device): the whole page flow works - uploading a CSV through
-the actual file input, running a query through `filter_gt`/`sum`/`emit`,
-getting back correct results - and, forcing a column past
-`WC_GPU_MIN_LEN`, `gpu_sum` actually round-trips through `reduce_sum.wgsl`
-on the real `GPUDevice`/`GPUBuffer`, not a stub, returning the exact
-correct sum. Getting here surfaced three real bugs, now fixed:
-`EXPORTED_RUNTIME_METHODS` needed `HEAPF64` added explicitly (this
-Emscripten version doesn't expose typed-array heap views by default);
-`MODULARIZE=1` alone emits a UMD/CommonJS factory with no real `export`,
-so `main.js`'s static `import` silently got `undefined` - needed
-`-s EXPORT_ES6=1`; and the preloaded grammar file resolved against the
-*page's* URL rather than `main.js`'s own, 404ing, since `index.html` and
-`web/src/wasm/` aren't siblings - fixed with an explicit `locateFile` in
-`main.js`. See README's "Bugs found" for the exact symptoms, useful if
-any of these regress on a different Emscripten version.
+**The parser** matches tokens against the grammar's rules and builds an
+AST. Each node carries a tag (`STX_FNCALL`, `STX_EXPR`, `STX_INIT`, …).
 
-The persistence server is verified too: `npm install && npm start` works
-(`better-sqlite3` from a prebuilt binary, no native compile needed), and
-`/api/queries`/`/api/dashboards` round-trip correctly through a real
-SQLite file with correct per-user isolation. One more real bug turned up
-here - `client.js` never actually sent the `x-user-id` header `auth.js`'s
-stub requires, so the UI's "Save query" button 401'd unconditionally,
-silently - fixed by generating a stable per-browser dev identity in
-`localStorage`.
+**The evaluator** (`interp.c`) walks that tree recursively and does what
+each tag means: an `STX_INIT` node binds a variable, an `STX_FNCALL` node
+calls a function, an `STX_EXPR` node computes a value. That recursive walk
+is what "tree-walking interpreter" means — no bytecode, no machine-code
+generation, just recursion over the tree.
 
-An automated test suite (`make test` - `interp/ext/test`'s native C
-suite, a Node smoke test against the real `emcc` build, `parse.js`'s unit
-tests, `server/`'s API integration tests) now locks in all of the above as
-a regression suite rather than a one-time manual check - see README's
-"Testing".
+### What the grammar file can and cannot change
 
-Categorical columns and `groupby` were verified the same three ways as
-everything else: the native C suite (dictionary encoding, aggregation
-math), a Node script against the real `emcc` build exercising the actual
-`wcEmitGroups`/`UTF8ToString` JS path, and the real browser/UI end to end
-- every category's sum in `groupby(col("category"), col("amount"), "sum")`
-against the sample CSV matched hand-computed values exactly.
+This is the most commonly misunderstood part of the design, so it's worth
+being precise.
 
-`emit()` streaming a full column and `groupby(cat_col)`'s count-only
-1-arg form were verified the same three ways again: `emit(col("category"))`
-against the sample CSV returned all 20 values in exact row order, and
-`groupby(col("category"))` returned per-category counts summing to 20 -
-both through the real browser/UI, not just the native suite or a Node
-script.
+The evaluator switches on a **fixed set of built-in tags**. A grammar file
+defines *concrete syntax* — what the language looks like — that produces
+those tags. So a grammar can freely change:
 
-The dashboard UI was verified in the real browser end to end: each result
-shape renders as the right form with correct values (stat tile, bar chart
-with a working hover tooltip and table-view toggle, table), and the full
-tile lifecycle - add, run, save, reload the page, load from the saved-
-dashboards dropdown, run again - round-tripped correctly through the real
-persistence API every time, same values as the query box gave directly.
-The chart/dashboard DOM code itself has no automated test coverage (no
-jsdom-equivalent dependency in this project to construct DOM without a
-real browser) - only `charts/format.js`'s pure formatting functions do;
-the rendering correctness rests on this manual verification, the same way
-the WebGPU path's does.
+- keywords and operators (`let x := 5` vs `int x = 5`)
+- statement shapes (braces required or not, parens around `if` or not)
+- the start symbol and overall program structure
 
-Every item on README's "First build checklist" is now verified; what's
-left is the "Known gaps" list there and above, which are deliberate scope
-cuts, not open questions about whether things work.
+What a grammar **cannot** do is invent new runtime meaning. Writing a
+`STX_SELECT` rule for SQL-style `SELECT sum(amount) FROM t` would parse
+fine and produce a tree — and then do nothing, because no case in the
+evaluator's switch handles that tag. Adding SQL means editing the
+evaluator too; repl2 has no macro or desugaring system that would let a
+grammar rewrite `SELECT …` into nested function calls on its own. That's
+real interpreter work, and it's why the SQL surface is listed as a
+separate feature rather than a quick win.
+
+### Session semantics
+
+One parser and one interpreter are created at startup and reused for every
+run, so state persists across queries like a notebook:
+
+```
+run 1:  let x := 5;
+run 2:  emit(x + 1);   →  6
+```
+
+---
+
+## 7. The builtin bridge — where the interpreter meets the data
+
+### The native-function hook
+
+repl2 knows nothing about CSVs, columns, or GPUs. web-csv adds one small
+patch to it (documented in
+[`interp/vendor/VENDORED.md`](../interp/vendor/VENDORED.md)): a hook that
+`evalCall` consults before falling through to user-defined functions. Our
+C code registers one callback, `wcNativeDispatch`, which matches on the
+function name:
+
+| Builtin | What it does |
+|---|---|
+| `col("name")` | look a column up in the store |
+| `sum(col)` | CPU sum of a numeric column |
+| `gpu_sum(col)` | same, but eligible for the GPU path (§8) |
+| `filter_gt(col, n)` | new column of values greater than `n` |
+| `groupby(cat)` | count of rows per category |
+| `groupby(cat, num, agg)` | `sum`/`count`/`avg`/`min`/`max` per category |
+| `emit(x)` | send a value or a whole column back to JS |
+
+The hook is deliberately generic — it knows nothing about columns — so
+this patch is plausibly upstreamable to repl2 rather than being a
+permanent fork.
+
+### How results get back to JavaScript
+
+Three `EM_JS` imports (C declarations whose bodies are JavaScript) push
+onto `Module.wcResults`:
+
+| Function | Pushes |
+|---|---|
+| `wcEmitNumber` | a bare number |
+| `wcEmitNumberArray` / `wcEmitStringArray` | `{type:'column', dtype, values}` |
+| `wcEmitGroups` | `{type:'groups', agg, labels, values}` |
+
+`emit()` on a column streams **every value** rather than summarizing —
+and for a categorical column it resolves each row's code back through the
+dictionary, so you get the actual per-row text, not the distinct list.
+Callers who want a summary ask for one explicitly with `sum()` or
+`groupby()`.
+
+`groupby` is an *output* operation, like `print` — it pushes its result
+rather than returning one, so `sum(groupby(...))` isn't expressible. The
+reason is that a grouped result is two parallel arrays and the
+interpreter's value type has no way to carry a pair like that; giving it
+one is a real change, deliberately deferred (§11).
+
+### Asyncify — the part that isn't obvious
+
+Here's the problem. Asking the GPU for a result is *asynchronous* in the
+browser: you submit work, then `await` a promise. But the call stack
+asking for it is compiled C:
+
+```
+wc_run → interpExec → execNode → evalNode → evalCall → doSum → "…await?"
+```
+
+C has no `await`. That whole stack is live on the WebAssembly call stack,
+and JavaScript can't just suspend it.
+
+**Asyncify** is Emscripten's solution: it rewrites the compiled code so
+those functions can *unwind* — save their local state, return control to
+the browser's event loop, and later *rewind* back to exactly where they
+left off when the promise resolves. From the C code's point of view,
+`wcGpuReduceSum(...)` looks like an ordinary blocking call that returns a
+double.
+
+The catch is that **every function on the path** to the async call needs
+that instrumentation, not just the one making it. The build currently uses
+`ASYNCIFY=1`, which instruments everything — correct, but it pays a size
+and speed cost in functions that never touch the GPU path (the scanner,
+the grammar loader). Narrowing it to `ASYNCIFY_ONLY` with an explicit
+function list is a real available optimization; the list should come from
+`emcc -s ASYNCIFY_ADVISE=1` rather than guesswork. Not done because
+correctness is already there and nothing has measured a need.
+
+---
+
+## 8. The GPU path
+
+### What a compute shader is doing here
+
+A CPU sums a million numbers by visiting them one at a time. A GPU has
+thousands of small cores and wants every one of them working at once — but
+"add all these up" isn't obviously parallel, since a running total is a
+single shared thing.
+
+The standard answer is a **parallel reduction**, a tournament bracket:
+
+```
+values:  3   1   4   1   5   9   2   6
+          \ /     \ /     \ /     \ /
+step 1:    4       5      14       8
+            \     /         \     /
+step 2:        9              22
+                 \          /
+step 3:            31
+```
+
+Each step halves the number of live values, so a million values finish in
+about 20 steps instead of a million, with every core busy at each step.
+
+[`reduce_sum.wgsl`](../web/src/gpu/shaders/reduce_sum.wgsl) does exactly
+this within each *workgroup* (a batch of 256 threads that share fast
+memory), producing one partial sum per workgroup. Those partials — a few
+thousand numbers at most — get read back and finished on the CPU, because
+a second GPU pass isn't worth it for that few values, and WGSL has no
+atomic float add to combine them on-GPU directly.
+
+### The f32 problem — a real precision tradeoff
+
+**WGSL has no f64.** Its numeric types are f32, i32, u32. So `bridge.js`
+downcasts the column to f32 before uploading.
+
+That is a genuine loss of precision, not a technicality. f32 carries about
+7 significant decimal digits; f64 carries about 15. Summing many values,
+or values spanning wide magnitudes, can visibly drift. This is the same
+class of problem behind floating-point surprises in any analysis tool —
+worth knowing about generally, not just here.
+
+The mitigation is the eligibility gate below: the CPU path stays exact
+f64, and it's what small or precision-sensitive sums take.
+
+### The eligibility gate
+
+Three conditions must *all* hold before work goes to the GPU (`doSum` in
+`builtins_gpu.c`):
+
+1. **The operation suits the GPU** — a columnar reduction, not branchy
+   per-row scripting. Only `sum` is wired for this today.
+2. **The column is large enough** — at least `WC_GPU_MIN_LEN` (50,000)
+   elements. Below that the CPU wins, because uploading a buffer,
+   dispatching a pipeline, and reading the result back all cost real time
+   a plain loop doesn't. *This threshold is an unbenchmarked starting
+   guess.*
+3. **WebGPU is actually available** — `navigator.gpu` resolves an adapter.
+
+Fail any one and the exact-f64 CPU loop runs instead. This is the general
+lesson worth taking from the GPU section: parallel hardware has a fixed
+setup cost, so it only pays off past a data-size threshold, and knowing
+where that threshold is matters more than knowing the shader.
+
+### Shader scope
+
+`reduce_sum.wgsl` is the only shader here. A GPU filter (predicate → mask)
+is the natural next one; a GPU `groupby` would extend the same reduction
+idea, keyed by category code instead of one global bucket. Sort and
+hash-join are established but genuinely substantial techniques (bitonic
+sort networks, GPU hash joins) and are out of scope — the CPU covers all
+of these today.
+
+---
+
+## 9. Charts and the dashboard
+
+### The result shape picks the chart
+
+`charts/render.js` dispatches on the *shape* of each result, not on what
+produced it:
+
+| Result | Form | Why |
+|---|---|---|
+| a bare number | stat tile | one value has no axes to plot against |
+| `{type:'groups'}` | bar chart | comparing magnitude across categories |
+| `{type:'column'}` | table | row-level data has no natural chart form |
+
+The same dispatch serves both the query box and every dashboard tile,
+because a tile is just "a query, run, its results rendered."
+
+### Why the bars are all one color
+
+Charts are hand-rolled SVG (no chart library — `web/` has no build step),
+following the `dataviz` skill's method. The color choice follows from what
+the color is *doing*: these charts are single-series magnitude comparisons
+— one aggregate per category — so color is doing a **sequential** job, not
+an identity job. Every bar therefore takes one already-validated accent
+hue rather than the eight-hue categorical palette.
+
+That's also why no palette validation run was needed: validation checks
+that *distinct* hues stay distinguishable under color-vision deficiency,
+which is not a question a one-color chart raises. Coloring each bar
+differently would have spent the identity channel re-encoding what bar
+length already shows.
+
+Each chart also ships a table view, a hover tooltip (value first, label
+second), and hit targets larger than the bars themselves.
+
+### What a dashboard is
+
+A named list of tiles, each holding one query string. Saving persists
+`{title, source}` pairs — **queries, not results**. So a loaded dashboard
+always reflects whatever CSV is currently loaded, never a stale snapshot
+baked in at save time.
+
+The tradeoff is real and worth stating: load a dashboard without loading
+its CSV first and its queries fail the same way any query missing its
+columns would. There's no stored data to fall back on.
+
+---
+
+## 10. The server
+
+`server/` is Express + SQLite and does exactly one job: remember saved
+queries and dashboard layouts. It also serves `web/` as static files for
+convenience. **It never runs a query** — all computation is client-side,
+so the page works with the backend unreachable; you just lose saving.
+
+Schema is three tables: `users`, `queries`, `dashboards`, each row owned by
+a user id.
+
+**Open decision, deliberately unresolved:**
+[`server/src/routes/auth.js`](../server/src/routes/auth.js) is a
+development stub — it trusts an `x-user-id` header with no login behind
+it, and the browser generates a random per-browser identity for it. That
+is fine on localhost and a real hole anywhere else. Choosing real auth
+(sessions vs. OAuth/SSO vs. something else) is a decision with tradeoffs
+that shouldn't be made implicitly by scaffolding code, so it wasn't.
+
+---
+
+## 11. Design decisions and tradeoffs
+
+Collected in one place — each of these is a deliberate cut, not an
+oversight.
+
+| Decision | Why | What it costs |
+|---|---|---|
+| Vendor repl2 rather than submodule it | repo builds standalone; the one local patch lives in-tree | manual re-sync when repl2 moves |
+| Columns `malloc`'d, not arena-allocated | lifetime is "until the CSV changes", not "until this query ends" | manual free discipline in C |
+| Dictionary built by linear scan | simple; fine at CSV category counts | O(n × distinct); wrong for high-cardinality columns |
+| `groupby` emits instead of returning | a grouped result is two parallel arrays; the value type can't hold a pair | `sum(groupby(...))` isn't expressible |
+| 2-arg `groupby` rejected outright | genuinely ambiguous — is arg 2 the numeric column or the aggregate name? | one more arity to remember |
+| `ASYNCIFY=1` (instrument everything) | correct with no analysis needed | size/speed cost in code that never awaits |
+| GPU threshold at 50,000 | dispatch overhead must be earned back | unbenchmarked guess; may be wrong in either direction |
+| GPU sums in f32 | WGSL has no f64 | precision drift on large/wide-ranging sums (§8) |
+| Only `sum` has a GPU path | filter/groupby/sort/join on GPU are each real projects | everything else stays CPU-bound |
+| Dashboards persist queries, not data | results always reflect current data | need the right CSV loaded before running |
+| Dev-stub auth | real auth is the user's decision to make | unusable beyond localhost as-is |
+| Function-call DSL, not SQL | SQL needs new evaluator semantics, not just a grammar (§6) | less familiar syntax for analysts |
+| No chart library | `web/` has no build step; keeps deps at zero | chart features are hand-built |
+
+---
+
+## 12. What's actually verified vs. not
+
+This project was built with a rule: claims here are things that were
+actually run, not things that ought to work.
+
+### Verified
+
+**The C engine**, first against a native compiler standing in for
+Emscripten, now against real `emcc` 6.0.5: grammar parsing, the native
+hook, the column store, and every builtin, including dictionary encoding
+and the aggregation math.
+
+**The WASM build and Asyncify**, under Node against the real build output.
+The Asyncify check specifically forced the GPU-eligible branch with a fake
+`navigator.gpu` and a stub bridge holding a real timer, confirming the C
+call stack genuinely suspends and resumes across an async JavaScript
+boundary — not merely that the build didn't error.
+
+**The real GPU path**, in a browser with a real WebGPU adapter: a column
+pushed past the 50,000 threshold round-tripped through `reduce_sum.wgsl`
+on a real `GPUDevice`/`GPUBuffer` and returned the exact correct sum.
+
+**The full UI**, in a real browser: CSV upload through the actual file
+input, queries returning hand-checked values, each result shape rendering
+as the right chart form, the hover tooltip and table-view toggle both
+working, and the whole dashboard lifecycle — add a tile, run, save, reload
+the page, load from the dropdown, run again — round-tripping correctly
+through the real persistence API.
+
+**The server**: `npm install && npm start`, both API routes round-tripping
+through a real SQLite file, with per-user isolation confirmed.
+
+Getting there surfaced four real bugs, all fixed and documented in the
+README's "Bugs found": a missing `HEAPF64` export, `MODULARIZE=1` emitting
+a CommonJS factory instead of an ES module, the preloaded grammar file
+404ing against the wrong base URL, and the API client never sending the
+auth header the server required.
+
+### Automated regression coverage
+
+`make test` runs four suites — the native C tests, the Node/WASM smoke
+test (which skips itself with a clear message if the build hasn't been
+run), the CSV-parser and chart-formatting unit tests, and the server's API
+integration tests against a throwaway database.
+
+### Not covered by automated tests
+
+- **The WGSL shader and WebGPU code.** Node has no WebGPU and there's no
+  headless-browser-with-GPU setup here. Verified by hand, as above.
+- **The chart and dashboard DOM code.** There's no jsdom-equivalent
+  dependency to build DOM without a browser, so only the pure
+  number-formatting functions have unit tests; rendering correctness rests
+  on the manual browser verification.
+
+Both are honest gaps in the *test suite*, not unverified functionality —
+they were checked, just not in a way that reruns automatically.
+
+---
+
+## 13. Suggested reading order in the code
+
+If you want to learn from this codebase rather than just use it, this
+order builds up naturally:
+
+1. **[`web/src/csv/parse.js`](../web/src/csv/parse.js)** — plain
+   JavaScript, no new concepts. How raw text becomes typed columns.
+2. **[`interp/ext/column.h`](../interp/ext/column.h)** — the data model
+   (§5). The header comments explain the reasoning; read it before the
+   `.c`.
+3. **[`interp/ext/column.c`](../interp/ext/column.c)** —
+   `columnCreateStrDict` is dictionary encoding in about 40 lines.
+4. **[`interp/ext/builtins_gpu.c`](../interp/ext/builtins_gpu.c)** — the
+   operations. `doGroupby` is the one to read closely; it's a complete
+   grouped-aggregation engine in one pass.
+5. **[`resources/grammar-csv.txt`](../resources/grammar-csv.txt)** — the
+   language, as data. Try changing a keyword and rerunning.
+6. **[`web/src/gpu/shaders/reduce_sum.wgsl`](../web/src/gpu/shaders/reduce_sum.wgsl)**
+   — the parallel reduction (§8), about 40 lines.
+7. **[`web/src/gpu/bridge.js`](../web/src/gpu/bridge.js)** — what actually
+   dispatching GPU work looks like: buffers, bind groups, readback.
+8. **[`interp/vendor/repl2/src/interp.c`](../interp/vendor/repl2/src/interp.c)**
+   — the biggest file here, and optional. `evalCall` is the interesting
+   part; the rest is a tree-walking evaluator in full.
+
+Good first changes to make, roughly in increasing difficulty: add a
+`filter_lt` next to `filter_gt`; add a `median` aggregate to `groupby`
+(note it needs the values, not just a running accumulator — that's the
+interesting part); add a horizontal bar chart form; give the dictionary
+build a hash table.
