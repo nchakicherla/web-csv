@@ -13,12 +13,13 @@ built vs. stubbed, and known gaps. This is a scaffold from an initial
 design pass, not a finished app - see "First build checklist" below for
 what's proven to work vs. still untested.
 
-**Status:** builds cleanly against real Emscripten (`emcc` 6.0.5) and runs
-correctly under Node, including a forced-GPU-path check that confirms
-Asyncify genuinely suspends and resumes the C call stack around a real
-async JS boundary. Not yet run in an actual browser, so the WebGPU/WGSL
-path itself (`web/src/gpu/bridge.js`, `reduce_sum.wgsl`) and the server
-are still unverified - see the checklist.
+**Status:** builds against real Emscripten (`emcc` 6.0.5) and has been
+run end to end in a real browser with real WebGPU hardware - CSV upload
+through the actual UI, a query using `filter_gt`/`sum`/`gpu_sum`/`emit`,
+and (separately, with a large enough column to clear the GPU eligibility
+threshold) a real dispatch through `reduce_sum.wgsl` on a real
+`GPUDevice`, all returning correct, hand-checked results. Only the
+persistence server (`server/`) hasn't been run yet - see the checklist.
 
 ## Layout
 
@@ -65,41 +66,69 @@ npm start
 Serves the frontend and the persistence API on `http://localhost:8787`
 (see `server/.env.example` for `PORT`/`WC_DB_PATH`). Open that URL, upload
 a CSV, and run the default query in the textbox - or without `server/` at
-all, serve `web/` with any static file server (e.g. `npx serve web`) if
-you don't need saved queries/dashboards yet.
+all, serve `web/` with any static file server (e.g. `python3 -m http.server
+8080 --directory web`, or `npx serve web`) if you don't need saved
+queries/dashboards yet.
+
+## Sample data
+
+[web/sample-data/transactions.csv](web/sample-data/transactions.csv) - 20
+rows, `id`/`amount`/`category` columns. Upload it and run the default
+query in the textbox as-is: `filter_gt(col("amount"), 100)` then `sum`
+should return `8183.23`, and `gpu_sum(col("amount"))` (falls back to CPU
+at this size - see the eligibility gate in ARCHITECTURE.md) `8512.01`.
+Both are hand-checked and match what a real browser run actually returned.
 
 ## First build checklist
 
-Verified:
+Verified, against the real toolchain (not a stand-in), in a real browser
+with real WebGPU hardware:
 
 1. ✅ Grammar parsing, the native-function hook, the column store, and
-   `col()`/`sum()`/`filter_gt()`/`emit()` all work correctly together
-   (native `cc` build, standing in for the interpreter core, during initial
-   scaffolding).
+   `col()`/`sum()`/`filter_gt()`/`emit()` all work correctly together.
 2. ✅ `cd interp/ext && make` succeeds against real `emcc` 6.0.5 with
-   `ASYNCIFY=1`, producing `web/src/wasm/interp.{js,wasm,data}`.
-   `EXPORTED_RUNTIME_METHODS` needs `HEAPF64` explicitly (this Emscripten
-   version doesn't expose it by default) - already fixed in the Makefile,
-   noted here in case an older/newer `emcc` behaves differently.
-3. ✅ `wc_init`/`wc_load_column_f64`/`wc_run` all work under Node against
-   the real build output (`node` from the `emsdk` install works fine for
-   this, no browser needed for the non-GPU path). A forced-GPU-path check
-   (fake `navigator.gpu` + a stub async bridge with a real `setTimeout`
-   delay) confirmed Asyncify actually suspends the C call stack
-   (`wc_run` → `evalCall` → ... → `wcGpuReduceSum`) across a real async JS
-   boundary and resumes with the correct result, not just that the build
-   didn't error.
+   `ASYNCIFY=1`, producing `web/src/wasm/interp.{js,wasm,data}`. Two real
+   build/glue issues turned up and are now fixed in the Makefile/`main.js`
+   (see "Bugs found" below) - `EXPORTED_RUNTIME_METHODS` needing `HEAPF64`
+   explicitly, `EXPORT_ES6=1` needing to be set for the `import` in
+   `main.js` to work at all, and `locateFile` needing to be set so the
+   preloaded grammar/wasm resolve against `main.js`'s own URL rather than
+   the page's.
+3. ✅ Asyncify genuinely suspends and resumes the C call stack around a
+   real async JS boundary (confirmed under Node first, with a forced
+   GPU-eligible path and a stub bridge with a real delay, before the
+   browser test existed).
+4. ✅ The full page flow works in a real browser: uploading
+   `sample-data/transactions.csv` through the actual file input, running
+   the default query, and getting back the correct, hand-checked results
+   (`8183.23`, `8512.01`) via `filter_gt`/`sum`/`emit`.
+5. ✅ `gpu_sum` actually round-trips through `reduce_sum.wgsl` on real
+   WebGPU hardware - forced past the `WC_GPU_MIN_LEN` eligibility
+   threshold with a 60,000-element column (the sample CSV is too small to
+   take this path on its own), it returned the exact correct sum through a
+   real `GPUDevice`/`GPUBuffer` dispatch, not a stub.
 
 Not yet verified:
 
-4. `gpu_sum` actually round-trips through `reduce_sum.wgsl` on real WebGPU
-   hardware in a real browser (`web/src/gpu/bridge.js`) - Node has no
-   WebGPU, so this only confirms Asyncify's mechanics (#3 above), not the
-   shader or `GPUDevice`/`GPUBuffer` code actually working. If this hangs
-   or errors in-browser, Asyncify itself is now a known-good starting
-   assumption - look at the shader/bridge code first.
-5. `cd server && npm install && npm start` - dependency versions in
-   `package.json` are unverified against current npm
+6. `cd server && npm install && npm start` - dependency versions in
+   `package.json` are unverified against current npm, and the persistence
+   API/routes haven't been exercised at all yet.
+
+### Bugs found doing the above (all fixed)
+
+- `EXPORTED_RUNTIME_METHODS` needed `HEAPF64` listed explicitly - this
+  Emscripten version doesn't expose wasm heap typed-array views by default,
+  and `main.js`/`bridge.js` both read/write it directly.
+- `main.js`'s `import createInterpModule from './wasm/interp.js'` silently
+  got `undefined` as the default export - `MODULARIZE=1` alone emits a
+  UMD/CommonJS factory (`module.exports = ...`), not a real ES module.
+  Needed `-s EXPORT_ES6=1`.
+- The preloaded grammar file (`interp.data`) 404'd at the page's root
+  (`GET /interp.data`) instead of next to the build output
+  (`/src/wasm/interp.data`), because `index.html` and `wasm/` aren't
+  siblings in this repo's layout. Fixed by passing `locateFile` to
+  `createInterpModule()` in `main.js`, resolved against
+  `import.meta.url` rather than the page's own URL.
 
 ## Known gaps
 

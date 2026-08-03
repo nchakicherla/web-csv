@@ -25,7 +25,15 @@ function setStatus(text) {
 }
 
 async function init() {
-	wasmModule = await createInterpModule();
+	// Without this, Module's preloaded-package loader resolves interp.data
+	// (and, in some Emscripten versions, interp.wasm) against the *page's*
+	// URL directory rather than this script's - fine when index.html and
+	// wasm/ are siblings, wrong here since index.html is at web/ and the
+	// build output is under web/src/wasm/. Confirmed by an actual browser
+	// run 404ing on GET /interp.data (root) instead of /src/wasm/interp.data.
+	wasmModule = await createInterpModule({
+		locateFile: (path) => new URL(`./wasm/${path}`, import.meta.url).href,
+	});
 	wasmModule.gpuBridge = createGpuBridge(wasmModule);
 
 	const rc = wasmModule.ccall('wc_init', 'number', ['string'], [GRAMMAR_PATH]);

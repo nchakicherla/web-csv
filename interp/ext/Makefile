@@ -44,6 +44,14 @@ EXPORTED_RUNTIME = \
 # loader, ...). Once this actually builds, replace it with ASYNCIFY_ONLY
 # listing just that call chain - get the exact (possibly name-mangled)
 # list from `emcc ... -s ASYNCIFY_ADVISE=1` rather than guessing it here.
+#
+# EXPORT_ES6=1: without it, MODULARIZE=1 alone emits a UMD/CommonJS
+# factory (module.exports = createInterpModule) with no real `export`
+# statement - main.js's `import createInterpModule from './wasm/interp.js'`
+# then silently gets `undefined` as the default export in a browser (no
+# `module`/`exports` globals there for the UMD branch to hit). Confirmed
+# by an actual browser run failing with "createInterpModule is not a
+# function" before this flag was added.
 LDFLAGS = \
   -s WASM=1 \
   -s ASYNCIFY=1 \
@@ -51,6 +59,7 @@ LDFLAGS = \
   -s EXPORTED_FUNCTIONS=$(EXPORTED_FUNCS) \
   -s EXPORTED_RUNTIME_METHODS=$(EXPORTED_RUNTIME) \
   -s MODULARIZE=1 \
+  -s EXPORT_ES6=1 \
   -s EXPORT_NAME=createInterpModule \
   --preload-file $(GRAMMAR_DEFAULT)@/resources/grammar-csv.txt
 

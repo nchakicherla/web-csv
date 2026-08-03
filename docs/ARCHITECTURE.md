@@ -162,15 +162,30 @@ for `emcc`, which wasn't installed yet): grammar parsing, the
 native-function hook, the column store, and `col`/`sum`/`filter_gt`/`emit`
 all work correctly together end to end.
 
-Verified since, against a real `emcc` 6.0.5 (`ASYNCIFY=1`) build run under
+Verified next, against a real `emcc` 6.0.5 (`ASYNCIFY=1`) build run under
 Node: `wc_init`/`wc_load_column_f64`/`wc_run` all work against the actual
 build output, and - by faking `navigator.gpu` and a stub async bridge with
 a real `setTimeout` delay to force `gpu_sum`'s GPU-eligible branch -
 Asyncify genuinely suspends the C call stack (`wc_run` → `evalCall` → ...
 → `wcGpuReduceSum`) across a real async JS boundary and resumes with the
-correct result. `EXPORTED_RUNTIME_METHODS` needed `HEAPF64` added
-explicitly (this Emscripten version doesn't expose typed-array heap views
-by default) - fixed in `interp/ext/Makefile`.
+correct result.
+
+Verified fully since, in a real browser (Chromium/Electron, real WebGPU
+adapter and device): the whole page flow works - uploading a CSV through
+the actual file input, running a query through `filter_gt`/`sum`/`emit`,
+getting back correct results - and, forcing a column past
+`WC_GPU_MIN_LEN`, `gpu_sum` actually round-trips through `reduce_sum.wgsl`
+on the real `GPUDevice`/`GPUBuffer`, not a stub, returning the exact
+correct sum. Getting here surfaced three real bugs, now fixed:
+`EXPORTED_RUNTIME_METHODS` needed `HEAPF64` added explicitly (this
+Emscripten version doesn't expose typed-array heap views by default);
+`MODULARIZE=1` alone emits a UMD/CommonJS factory with no real `export`,
+so `main.js`'s static `import` silently got `undefined` - needed
+`-s EXPORT_ES6=1`; and the preloaded grammar file resolved against the
+*page's* URL rather than `main.js`'s own, 404ing, since `index.html` and
+`web/src/wasm/` aren't siblings - fixed with an explicit `locateFile` in
+`main.js`. See README's "Bugs found" for the exact symptoms, useful if
+any of these regress on a different Emscripten version.
 
 **Still not verified** (no browser with WebGPU available while doing
 this): the WGSL shader (`reduce_sum.wgsl`) and the `GPUDevice`/`GPUBuffer`
