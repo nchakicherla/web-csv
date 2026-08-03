@@ -13,13 +13,16 @@ built vs. stubbed, and known gaps. This is a scaffold from an initial
 design pass, not a finished app - see "First build checklist" below for
 what's proven to work vs. still untested.
 
-**Status:** builds against real Emscripten (`emcc` 6.0.5) and has been
-run end to end in a real browser with real WebGPU hardware - CSV upload
+**Status:** builds against real Emscripten (`emcc` 6.0.5) and has been run
+end to end in a real browser with real WebGPU hardware - CSV upload
 through the actual UI, a query using `filter_gt`/`sum`/`gpu_sum`/`emit`,
-and (separately, with a large enough column to clear the GPU eligibility
+(separately, with a large enough column to clear the GPU eligibility
 threshold) a real dispatch through `reduce_sum.wgsl` on a real
-`GPUDevice`, all returning correct, hand-checked results. Only the
-persistence server (`server/`) hasn't been run yet - see the checklist.
+`GPUDevice`, and the persistence server (`npm install && npm start`,
+saving/listing a query through the real UI code path against a real
+SQLite file) - all returning correct, hand-checked results. Every item on
+the checklist below is now verified; see "Known gaps" for what's still
+deliberately unbuilt.
 
 ## Layout
 
@@ -107,12 +110,15 @@ with real WebGPU hardware:
    threshold with a 60,000-element column (the sample CSV is too small to
    take this path on its own), it returned the exact correct sum through a
    real `GPUDevice`/`GPUBuffer` dispatch, not a stub.
-
-Not yet verified:
-
-6. `cd server && npm install && npm start` - dependency versions in
-   `package.json` are unverified against current npm, and the persistence
-   API/routes haven't been exercised at all yet.
+6. ✅ `cd server && npm install && npm start` works - `better-sqlite3`
+   installed from a prebuilt binary (no native compile needed), the
+   server serves `web/` correctly, and `/api/queries`/`/api/dashboards`
+   round-trip through a real SQLite file (`server/data/web-csv.sqlite`,
+   WAL mode) with correct per-user isolation (a saved query under one
+   `x-user-id` correctly doesn't show up when listing under another).
+   One real integration bug found and fixed: `web/src/api/client.js`
+   never actually sent the `x-user-id` header `auth.js` requires, so the
+   "Save query" button 401'd unconditionally - see "Bugs found".
 
 ### Bugs found doing the above (all fixed)
 
@@ -129,6 +135,11 @@ Not yet verified:
   siblings in this repo's layout. Fixed by passing `locateFile` to
   `createInterpModule()` in `main.js`, resolved against
   `import.meta.url` rather than the page's own URL.
+- `client.js`'s `fetch` calls to `/api/queries`/`/api/dashboards` never
+  sent an `x-user-id` header, so every request 401'd against `auth.js`'s
+  stub auth - the UI's "Save query" button was silently broken. Fixed by
+  generating a stable per-browser dev identity (`localStorage`) and
+  sending it on every request; see `client.js`'s `getDevUserId`.
 
 ## Known gaps
 

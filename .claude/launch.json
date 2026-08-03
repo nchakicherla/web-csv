@@ -6,6 +6,12 @@
 			"runtimeExecutable": "python3",
 			"runtimeArgs": ["-m", "http.server", "8080", "--directory", "web"],
 			"port": 8080
+		},
+		{
+			"name": "web-csv-server",
+			"runtimeExecutable": "sh",
+			"runtimeArgs": ["-c", ". ~/emsdk/emsdk_env.sh >/dev/null 2>&1; cd server && npm start"],
+			"port": 8787
 		}
 	]
 }

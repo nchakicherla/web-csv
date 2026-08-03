@@ -187,9 +187,13 @@ so `main.js`'s static `import` silently got `undefined` - needed
 `main.js`. See README's "Bugs found" for the exact symptoms, useful if
 any of these regress on a different Emscripten version.
 
-**Still not verified** (no browser with WebGPU available while doing
-this): the WGSL shader (`reduce_sum.wgsl`) and the `GPUDevice`/`GPUBuffer`
-code in `bridge.js` actually running correctly - Node has no WebGPU, so
-the check above only proves Asyncify's mechanics, not the shader itself -
-and the server (`server/`) actually starting. See README's "First build
-checklist" for what to run to close these out.
+The persistence server is verified too: `npm install && npm start` works
+(`better-sqlite3` from a prebuilt binary, no native compile needed), and
+`/api/queries`/`/api/dashboards` round-trip correctly through a real
+SQLite file with correct per-user isolation. One more real bug turned up
+here - `client.js` never actually sent the `x-user-id` header `auth.js`'s
+stub requires, so the UI's "Save query" button 401'd unconditionally,
+silently - fixed by generating a stable per-browser dev identity in
+`localStorage`. Every item on README's "First build checklist" is now
+verified; what's left is the "Known gaps" list there and above, which are
+deliberate scope cuts, not open questions about whether things work.

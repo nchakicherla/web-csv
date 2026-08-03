@@ -13,6 +13,8 @@ dist/
 interp/build/
 web/src/wasm/
 
-# sqlite data
+# sqlite data (db.js runs in WAL mode, hence -shm/-wal alongside the .sqlite itself)
 server/data/*.sqlite
 server/data/*.sqlite-journal
+server/data/*.sqlite-shm
+server/data/*.sqlite-wal
