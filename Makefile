@@ -6,7 +6,7 @@
 #   make test-c         interp/ext/test's native C suite (no emcc needed)
 #   make test-wasm       Node smoke test against the real emcc build -
 #                        skips itself if `make -C interp/ext` hasn't run
-#   make test-web        web/src/csv's CSV parser unit tests
+#   make test-web        CSV parser + chart-formatting unit tests
 #   make test-server      server/'s API integration tests - needs
 #                         `npm install` in server/ first
 #
@@ -24,7 +24,7 @@ test-wasm:
 	node --test interp/ext/test/wasm_smoke.test.mjs
 
 test-web:
-	node --test web/src/csv/parse.test.js
+	node --test web/src/csv/parse.test.js web/src/charts/format.test.js
 
 test-server:
 	npm test --prefix server

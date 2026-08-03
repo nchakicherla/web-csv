@@ -4,12 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>web-csv</title>
+<link rel="stylesheet" href="src/charts/theme.css">
 <style>
-	body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+	body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
 	textarea { width: 100%; font-family: ui-monospace, monospace; font-size: 0.9rem; }
 	pre { background: #f4f4f4; padding: 0.75rem; overflow-x: auto; }
 	#status { color: #555; }
 	.row { margin: 0.75rem 0; }
+	section { margin: 2rem 0; padding-top: 1rem; border-top: 1px solid #ddd; }
+	.tile-card { border: 1px solid #ddd; border-radius: 8px; padding: 0.75rem 1rem; margin: 0.75rem 0; }
+	.tile-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; }
+	.tile-header strong { flex: 1; }
+	.tile-source { background: #f4f4f4; padding: 0.5rem; font-size: 0.8rem; overflow-x: auto; margin: 0 0 0.5rem; }
+	.tile-results { display: flex; flex-wrap: wrap; gap: 0.75rem; }
+	.tile-results > * { flex: 1 1 320px; }
 </style>
 </head>
 <body>
@@ -21,21 +29,37 @@
 		<input type="file" id="csv-file" accept=".csv">
 	</div>
 
-	<div class="row">
+	<section>
+		<h2>Query</h2>
 		<label for="query">Query (grammar-csv.txt syntax):</label><br>
 		<textarea id="query" rows="7">let big := filter_gt(col("amount"), 100);
 emit(sum(big));
 emit(gpu_sum(col("amount")));
 groupby(col("category"), col("amount"), "sum");</textarea>
-	</div>
 
-	<div class="row">
-		<button id="run">Run</button>
-		<button id="save">Save query</button>
-	</div>
+		<div class="row">
+			<button id="run">Run</button>
+			<button id="save">Save query</button>
+			<button id="add-to-dashboard">Add to dashboard</button>
+		</div>
 
-	<h2>Results</h2>
-	<pre id="results">[]</pre>
+		<div id="results"></div>
+		<details>
+			<summary>Raw JSON</summary>
+			<pre id="results-json">[]</pre>
+		</details>
+	</section>
+
+	<section>
+		<h2>Dashboard</h2>
+		<div class="row">
+			<select id="dashboard-load-select"></select>
+			<button id="dashboard-load">Load</button>
+			<button id="dashboard-run-all">Run dashboard</button>
+			<button id="dashboard-save">Save dashboard</button>
+		</div>
+		<div id="dashboard-tiles"></div>
+	</section>
 
 	<script type="module" src="src/main.js"></script>
 </body>

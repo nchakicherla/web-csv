@@ -17,6 +17,8 @@ web/               browser UI, CSV parsing, WebGPU bridge, static JS
     gpu/bridge.js         Module.gpuBridge - the JS side of the async boundary
     gpu/shaders/*.wgsl    compute shaders
     api/client.js         talks to server/
+    charts/                bar chart / stat tile / table renderers + theme.css
+    dashboard.js            tile add/remove/run/save/load
     main.js               wires it all together
     wasm/                 emcc build output (gitignored, not committed)
 
@@ -192,6 +194,41 @@ auth - sessions vs. OAuth/SSO vs. something else - is a decision with
 tradeoffs that shouldn't get made implicitly by scaffolding code; it needs
 to happen before this is exposed anywhere beyond localhost.
 
+## Dashboard & charts
+
+`web/src/charts/render.js` picks a form by the shape of a `wcResults`
+entry, not by what produced it: a bare number is a stat tile, a `groupby`
+result (`{type:'groups', ...}`) is a bar chart, a whole column
+(`{type:'column', ...}`) is a table - the same dispatch serves both the
+ad-hoc query box's results area and every dashboard tile, since a tile is
+just "a query, run, its results rendered" with nothing dashboard-specific
+about the rendering itself.
+
+**No chart library.** `web/` has no build step (plain ES modules), so
+`charts/bar.js` is hand-rolled SVG + DOM rather than a dependency - gridlines,
+rounded-top bars, a hover tooltip, and a table-view toggle, all styled
+through `charts/theme.css`'s CSS custom properties. Colors come from the
+`dataviz` skill's reference palette, chosen by the job the color is doing
+per its `choosing-a-form.md`: every chart here is a single-series magnitude
+comparison (one aggregate value per category), which is a **sequential**
+job (one hue, light→dark), not identity - so bars use one fixed accent
+color (`--series-1`, the documented blue) rather than the 8-hue categorical
+set. That's also why no palette validation run was needed: validation
+(`scripts/validate_palette.js`) checks that *distinct* categorical hues stay
+tell-apart-able under color-vision deficiency, which doesn't apply to a
+chart using exactly one already-vetted color for every bar.
+
+**A dashboard is a named list of tiles**, each just a query source string
+(`web/src/dashboard.js`). Running a tile runs its query against whatever
+CSV is currently loaded and renders every result it produces via
+`renderResults`. Saving persists `{title, source}` pairs through
+`/api/dashboards` (`layout: {tiles: [...]}`) - deliberately not the
+*results*, so a loaded dashboard always reflects whatever CSV is loaded
+when you run it, never a stale snapshot baked in at save time. The
+tradeoff: loading a dashboard without the right CSV loaded first just
+fails the way any query missing its columns would - there's no stored
+data to fall back on.
+
 ## What's actually verified vs. not
 
 Verified by a native `cc` build during initial scaffolding (standing in
@@ -252,6 +289,18 @@ against the sample CSV returned all 20 values in exact row order, and
 `groupby(col("category"))` returned per-category counts summing to 20 -
 both through the real browser/UI, not just the native suite or a Node
 script.
+
+The dashboard UI was verified in the real browser end to end: each result
+shape renders as the right form with correct values (stat tile, bar chart
+with a working hover tooltip and table-view toggle, table), and the full
+tile lifecycle - add, run, save, reload the page, load from the saved-
+dashboards dropdown, run again - round-tripped correctly through the real
+persistence API every time, same values as the query box gave directly.
+The chart/dashboard DOM code itself has no automated test coverage (no
+jsdom-equivalent dependency in this project to construct DOM without a
+real browser) - only `charts/format.js`'s pure formatting functions do;
+the rendering correctness rests on this manual verification, the same way
+the WebGPU path's does.
 
 Every item on README's "First build checklist" is now verified; what's
 left is the "Known gaps" list there and above, which are deliberate scope

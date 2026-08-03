@@ -1,0 +1,200 @@
+/* theme.css - chart chrome tokens, from the dataviz skill's reference
+ * palette (references/palette.md). Every chart in web/src/charts/ is
+ * written against these roles, never raw hex, so light/dark swap in one
+ * place. Our charts are single-series magnitude comparisons (one
+ * aggregate per category), so this only needs the sequential accent
+ * (--series-1, the documented blue) - not the 8-hue categorical set,
+ * which is for telling series apart by identity, a job none of our
+ * charts currently have.
+ */
+
+.viz-root {
+	color-scheme: light;
+	--surface-1: #fcfcfb;
+	--text-primary: #0b0b0b;
+	--text-secondary: #52514e;
+	--text-muted: #898781;
+	--gridline: #e1e0d9;
+	--baseline: #c3c2b7;
+	--series-1: #2a78d6;
+	--border: rgba(11, 11, 11, 0.10);
+	--hover-lift: rgba(11, 11, 11, 0.06);
+}
+
+@media (prefers-color-scheme: dark) {
+	:root:where(:not([data-theme="light"])) .viz-root {
+		color-scheme: dark;
+		--surface-1: #1a1a19;
+		--text-primary: #ffffff;
+		--text-secondary: #c3c2b7;
+		--text-muted: #898781;
+		--gridline: #2c2c2a;
+		--baseline: #383835;
+		--series-1: #3987e5;
+		--border: rgba(255, 255, 255, 0.10);
+		--hover-lift: rgba(255, 255, 255, 0.10);
+	}
+}
+
+:root[data-theme="dark"] .viz-root {
+	color-scheme: dark;
+	--surface-1: #1a1a19;
+	--text-primary: #ffffff;
+	--text-secondary: #c3c2b7;
+	--text-muted: #898781;
+	--gridline: #2c2c2a;
+	--baseline: #383835;
+	--series-1: #3987e5;
+	--border: rgba(255, 255, 255, 0.10);
+	--hover-lift: rgba(255, 255, 255, 0.10);
+}
+
+.viz-root {
+	background: var(--surface-1);
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	padding: 12px 16px;
+	font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.viz-title {
+	font-size: 0.85rem;
+	font-weight: 600;
+	color: var(--text-primary);
+	margin: 0 0 8px;
+}
+
+.viz-toolbar {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+	margin-bottom: 4px;
+}
+
+.viz-toolbar button {
+	font-size: 0.75rem;
+	color: var(--text-secondary);
+	background: none;
+	border: 1px solid var(--border);
+	border-radius: 4px;
+	padding: 2px 8px;
+	cursor: pointer;
+}
+
+.viz-toolbar button:hover {
+	background: var(--hover-lift);
+}
+
+/* --- bar chart --- */
+
+.viz-bar {
+	fill: var(--series-1);
+}
+
+.viz-bar-hit {
+	fill: transparent;
+	cursor: pointer;
+}
+
+.viz-bar-hit:hover + .viz-bar,
+.viz-bar-hit:focus + .viz-bar {
+	fill: var(--series-1);
+	filter: brightness(1.12);
+}
+
+.viz-bar-hit:focus {
+	outline: none;
+}
+
+.viz-axis-line {
+	stroke: var(--baseline);
+	stroke-width: 1;
+}
+
+.viz-gridline {
+	stroke: var(--gridline);
+	stroke-width: 1;
+}
+
+.viz-tick-label {
+	fill: var(--text-muted);
+	font-size: 10px;
+}
+
+.viz-category-label {
+	fill: var(--text-secondary);
+	font-size: 10px;
+}
+
+.viz-value-label {
+	fill: var(--text-primary);
+	font-size: 10px;
+	font-weight: 600;
+}
+
+.viz-tooltip {
+	position: absolute;
+	pointer-events: none;
+	background: var(--text-primary);
+	color: var(--surface-1);
+	font-size: 0.75rem;
+	padding: 4px 8px;
+	border-radius: 4px;
+	white-space: nowrap;
+	transform: translate(-50%, -100%);
+	z-index: 10;
+	opacity: 0;
+	transition: opacity 0.1s;
+}
+
+.viz-tooltip.is-visible {
+	opacity: 1;
+}
+
+.viz-tooltip-value {
+	font-weight: 700;
+}
+
+/* --- stat tile --- */
+
+.viz-stat-label {
+	font-size: 0.8rem;
+	color: var(--text-secondary);
+	margin: 0 0 4px;
+}
+
+.viz-stat-value {
+	font-size: 2rem;
+	font-weight: 600;
+	color: var(--text-primary);
+	font-variant-numeric: proportional-nums;
+}
+
+/* --- table --- */
+
+.viz-table {
+	width: 100%;
+	border-collapse: collapse;
+	font-size: 0.8rem;
+}
+
+.viz-table th {
+	text-align: left;
+	color: var(--text-secondary);
+	font-weight: 600;
+	border-bottom: 1px solid var(--baseline);
+	padding: 4px 8px;
+}
+
+.viz-table td {
+	padding: 4px 8px;
+	border-bottom: 1px solid var(--gridline);
+	color: var(--text-primary);
+	font-variant-numeric: tabular-nums;
+}
+
+.viz-table-note {
+	color: var(--text-muted);
+	font-size: 0.75rem;
+	margin-top: 6px;
+}

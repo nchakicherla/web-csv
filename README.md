@@ -6,9 +6,12 @@ tree-walking interpreter, compiled to WASM. Numeric *and* categorical
 columns are supported (`col()`, `filter_gt()`, `groupby()` with
 sum/count/avg/min/max aggregates). Parallelizable operations (currently:
 summing a numeric column) run as WebGPU compute shaders on eligible
-hardware, falling back to plain WASM otherwise. A small Node/SQLite
-service persists saved queries and dashboards; the compute path itself
-needs no backend.
+hardware, falling back to plain WASM otherwise. Results render as bar
+charts, stat tiles, or tables (`web/src/charts/`, no chart library - plain
+SVG/DOM against the dataviz skill's reference palette), and a query can be
+saved as a dashboard tile, assembled with others, and persisted. A small
+Node/SQLite service persists saved queries and dashboards; the compute
+path itself needs no backend.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design, what's
 built vs. stubbed, and known gaps. This is a scaffold from an initial
@@ -35,7 +38,10 @@ interp/ext/            web-csv's C layer: column store, GPU-aware builtins,
 interp/ext/test/        native C tests + the Node/wasm smoke test
 resources/             grammar-csv.txt, the default query/scripting grammar
 web/                   browser UI, CSV parsing, WebGPU bridge
+web/src/charts/         bar chart / stat tile / table renderers + theme.css
+web/src/dashboard.js     tile add/remove/run/save/load
 web/src/csv/parse.test.js  CSV parser unit tests
+web/src/charts/format.test.js  chart number-formatting unit tests
 server/                persistence API (saved queries/dashboards) + static host
 server/test/             API integration tests
 docs/                  architecture notes
@@ -112,9 +118,9 @@ column-store/builtin logic - no `emcc` needed, ~instant), a Node smoke test
 against the real `emcc` build (`wc_init`/`wc_run`, plus a forced-GPU-path
 check that Asyncify actually suspends/resumes around a real async
 boundary - skips itself with a clear message if `interp/ext`'s `make`
-hasn't been run yet), the CSV parser's unit tests, and the server's API
-integration tests (real Express + a throwaway SQLite file per run, needs
-`npm install` in `server/` first). Each suite also runs standalone - see
+hasn't been run yet), the CSV parser's and chart-formatting unit tests,
+and the server's API integration tests (real Express + a throwaway SQLite
+file per run, needs `npm install` in `server/` first). Each suite also runs standalone - see
 the `Makefile` at the repo root for the individual targets
 (`test-c`/`test-wasm`/`test-web`/`test-server`).
 
@@ -122,8 +128,13 @@ This locks in everything the "First build checklist" below verified by
 hand originally, as an automated regression suite - what it deliberately
 does *not* cover is the real WGSL shader/`GPUDevice` path, since that
 needs a real browser with WebGPU and there's no headless-browser-with-GPU
-setup in this repo (yet). That one stays a manual check; see the
-checklist's item 5.
+setup in this repo (yet), and the chart/dashboard DOM code
+(`web/src/charts/bar.js`/`table.js`/`stat.js`/`dashboard.js`) - there's no
+jsdom (or similar) dependency in this project to unit-test DOM
+construction without a real browser, so only `format.js`'s pure
+number-formatting functions get `node --test` coverage; the rendering
+itself is verified the same way the WebGPU path is, by hand in a real
+browser - see the checklist's items 5 and 9.
 
 ## First build checklist
 
@@ -177,6 +188,14 @@ with real WebGPU hardware:
    against the sample CSV: `emit(col("category"))` returned all 20
    values in exact row order, `groupby(col("category"))` returned counts
    summing to 20.
+9. ✅ The dashboard UI works end to end in a real browser: a query's
+   results render as the right chart form (stat tile for a number, bar
+   chart for a `groupby` result, table for a raw column) with correct
+   values, hover tooltips, and a working table-view toggle; adding a tile,
+   running the whole dashboard, saving it, reloading the page, loading it
+   back from the saved-dashboards dropdown, and running it again all
+   round-tripped correctly through the real persistence API - same
+   `8183.23`/`8512.01`/per-category values every time.
 
 ### Bugs found doing the above (all fixed)
 
@@ -204,6 +223,23 @@ with real WebGPU hardware:
 Deliberate scope cuts, each with a reason it's staying that way for now
 rather than a TODO waiting to be picked up:
 
+- Dashboards persist queries, not data - loading a saved dashboard doesn't
+  restore whatever CSV was loaded when it was built, and running it
+  against no CSV (or a different one, with different column names) fails
+  the way any query without the right columns loaded would. Persisting a
+  CSV snapshot alongside a dashboard is a real feature, not attempted here.
+- A tile's query is fixed once added - there's no in-place editor on the
+  dashboard, only "Remove" and re-add via the query box above. Editable
+  tiles are a natural follow-up once the tile card has a reason to be more
+  than a display.
+- Only three chart forms exist: stat tile (a bare number), bar chart (a
+  `groupby` result), and table (a raw column or the accessibility twin of
+  a bar chart). There's no line/time-series chart, because there's no
+  date/time column type yet to plot against - see the column-types gap.
+- Loading a saved dashboard doesn't auto-run it (a deliberate choice: the
+  CSV needs to be loaded first, and running immediately against nothing
+  loaded would just error) - the user has to click "Run dashboard"
+  afterward, which is one extra click but avoids a confusing failure.
 - Only `sum` has a GPU path. `filter_gt`/`groupby` are CPU-only; GPU
   filter/groupby/sort/join are all real engineering effort (see
   ARCHITECTURE.md's shader-scope note) - a project on their own, not a
