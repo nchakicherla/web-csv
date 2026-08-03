@@ -91,6 +91,13 @@ query in the textbox as-is:
   electronics: 1289.43, coffee: 62.23, rent: 2075.25, utilities: 580,
   travel: 4328}` (emitted as `{type:'groups', labels, values}`, not a
   plain object - see `agg` for which aggregate ran)
+- `groupby(col("category"))` (1-arg form) -> counts per category without
+  needing a numeric column: `{groceries: 4, electronics: 3, coffee: 5,
+  rent: 2, utilities: 3, travel: 3}` (sums to 20, the row count)
+- `emit(col("category"))` -> all 20 category values, in row order,
+  resolved from the dictionary (`{type:'column', dtype:'string',
+  values:[...]}`) - not summarized, unlike `emit(col("amount"))` for a
+  numeric column, which now also streams every value rather than a sum
 
 All hand-checked and matching what a real browser run actually returned.
 
@@ -163,6 +170,13 @@ with real WebGPU hardware:
    uploading the sample CSV's `category` column and running
    `groupby(col("category"), col("amount"), "sum")` - every category's
    sum matched hand-computed values exactly.
+8. ✅ `emit()` on a column now streams every value instead of summarizing
+   it (`wcEmitNumberArray`/`wcEmitStringArray`), and `groupby(cat_col)`
+   (1-arg, count-only, no numeric column needed) both work correctly -
+   verified the same three ways as #7, including in the real browser
+   against the sample CSV: `emit(col("category"))` returned all 20
+   values in exact row order, `groupby(col("category"))` returned counts
+   summing to 20.
 
 ### Bugs found doing the above (all fixed)
 
@@ -187,31 +201,33 @@ with real WebGPU hardware:
 
 ## Known gaps
 
-- `emit()` on a plain (non-categorical) column argument summarizes it
-  (sums it) rather than streaming the whole column back to JS - real
-  chart-from-a-result-column support needs a pointer/length export like
-  `wc_load_column_f64`'s counterpart, in reverse.
+Deliberate scope cuts, each with a reason it's staying that way for now
+rather than a TODO waiting to be picked up:
+
 - Only `sum` has a GPU path. `filter_gt`/`groupby` are CPU-only; GPU
-  filter/groupby/sort/join are all future work (see ARCHITECTURE.md's
-  shader-scope note).
-- `groupby(cat_col, num_col, agg)` requires a numeric column even for
-  `"count"`, which doesn't use its values - a `count_by(cat_col)`
-  convenience wrapper is a reasonable follow-up, not built to keep the
-  builtin surface small for now.
+  filter/groupby/sort/join are all real engineering effort (see
+  ARCHITECTURE.md's shader-scope note) - a project on their own, not a
+  quick follow-up.
 - `groupby()`'s dictionary build (`columnCreateStrDict`) is an O(n *
   distinct_values) linear scan against the dict-so-far, not a hash table -
   fine for a CSV's worth of categories (tens to low hundreds), not for
-  high-cardinality columns.
+  high-cardinality columns. A performance concern, not a correctness one,
+  and not yet benchmarked as an actual problem.
 - `groupby()` emits its result directly rather than returning a value the
   script can keep composing with (same role `print`/`emit` already have) -
   `sum(groupby(...))` isn't a thing. A dedicated result type that could
-  carry labels alongside values would remove this limitation, at the cost
-  of more machinery than a first pass needs.
+  carry labels alongside values would remove this limitation - better
+  designed once the dashboard UI defines what "chartable data" actually
+  needs to look like than guessed at ahead of that.
 - `ASYNCIFY=1` instruments the whole interpreter rather than the narrower
-  `ASYNCIFY_ONLY` call path - fine for correctness, worth tightening once
-  there's a real build to derive the exact list from.
-- Auth is a localhost-only stub (`server/src/routes/auth.js`) - not
-  suitable for anything beyond one developer's own machine.
+  `ASYNCIFY_ONLY` call path - fine for correctness (verified working, see
+  the checklist), worth tightening once there's a reason size/speed
+  actually matters here.
+- Auth is a localhost-only stub (`server/src/routes/auth.js`) - real auth
+  (sessions vs. OAuth/SSO vs. something else) is a decision with
+  tradeoffs that needs to be made deliberately, not defaulted to by
+  scaffolding code.
 - `resources/grammar-csv.txt` is a function-call-style DSL, not SQL - see
   ARCHITECTURE.md's grammar section for why a SQL surface needs new
-  interpreter semantics, not just a new grammar file.
+  interpreter semantics, not just a new grammar file - a genuinely
+  separate feature, not a gap in the current one.

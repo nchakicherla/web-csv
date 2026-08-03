@@ -1,9 +1,9 @@
 /* js_stubs.c - native stand-ins for what Emscripten's glue and
  * web/src/gpu/bridge.js provide in the real build: wcGpuAvailable(),
- * wcGpuReduceSum(), wcEmitNumber(), and wcEmitGroups() (all
- * builtins_gpu.c). Lets test_builtins.c drive wc_init/wc_load_column_f64/
- * wc_load_column_str_dict/wc_run (web_main.c) exactly as the real entry
- * points, unmodified.
+ * wcGpuReduceSum(), wcEmitNumber(), wcEmitGroups(), wcEmitNumberArray(),
+ * and wcEmitStringArray() (all builtins_gpu.c). Lets test_builtins.c
+ * drive wc_init/wc_load_column_f64/wc_load_column_str_dict/wc_run
+ * (web_main.c) exactly as the real entry points, unmodified.
  *
  * g_wc_gpu_available and g_gpu_path_taken exist so tests can force and
  * then verify which branch gpu_sum's eligibility gate actually took,
@@ -28,6 +28,13 @@ char g_group_labels_joined[256];
 double g_group_values[64];
 uint32_t g_group_n = 0;
 char g_group_agg[16];
+
+/* emit(column) results - same "capture the joined form, don't re-parse
+ * it" approach as the group globals above. */
+double g_emitted_col_f64[64];
+uint32_t g_n_emitted_col_f64 = 0;
+char g_emitted_col_str_joined[256];
+uint32_t g_n_emitted_col_str = 0;
 
 int wcGpuAvailable(void) {
 	return g_wc_gpu_available;
@@ -58,4 +65,18 @@ void wcEmitGroups(const char *labels_joined, double *values, uint32_t n_groups, 
 	for (i = 0; i < g_group_n; i++) {
 		g_group_values[i] = values[i];
 	}
+}
+
+void wcEmitNumberArray(double *ptr, uint32_t len) {
+	uint32_t i;
+	g_n_emitted_col_f64 = len < 64 ? len : 64;
+	for (i = 0; i < g_n_emitted_col_f64; i++) {
+		g_emitted_col_f64[i] = ptr[i];
+	}
+}
+
+void wcEmitStringArray(const char *values_joined, uint32_t len) {
+	strncpy(g_emitted_col_str_joined, values_joined, sizeof(g_emitted_col_str_joined) - 1);
+	g_emitted_col_str_joined[sizeof(g_emitted_col_str_joined) - 1] = '\0';
+	g_n_emitted_col_str = len;
 }

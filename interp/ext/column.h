@@ -74,11 +74,19 @@ const char *columnName(const Column *col);
 /* COL_STR_DICT only - 0 for any other type. */
 uint32_t columnDictLen(const Column *col);
 
-/* COL_STR_DICT only - the column's dictionary entries joined with '\x1f'
- * (ASCII Unit Separator - ordinary CSV/category text essentially never
- * contains it, so no escaping scheme is needed for the delimiter itself).
- * Malloc'd, caller frees. NULL for any other column type. */
+/* COL_STR_DICT only - the column's dictionary entries (dict_len distinct
+ * values) joined with '\x1f' (ASCII Unit Separator - ordinary CSV/category
+ * text essentially never contains it, so no escaping scheme is needed for
+ * the delimiter itself). Malloc'd, caller frees. NULL for any other
+ * column type. */
 char *columnDictJoined(const Column *col);
+
+/* COL_STR_DICT only - all `len` per-row values (not just the distinct
+ * ones), in row order, each resolved from its code through the
+ * dictionary, '\x1f'-joined the same way. What emit() streams back for a
+ * categorical column - see builtins_gpu.c's doEmit. Malloc'd, caller
+ * frees. NULL for any other column type. */
+char *columnResolveJoined(const Column *col);
 
 /* NULL if `col` is not that type - callers should check columnType() first;
  * these are for the JS/EMSCRIPTEN_KEEPALIVE accessors and the CPU builtins,

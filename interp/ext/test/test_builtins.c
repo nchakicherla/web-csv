@@ -43,12 +43,19 @@ extern char g_group_labels_joined[256];
 extern double g_group_values[64];
 extern uint32_t g_group_n;
 extern char g_group_agg[16];
+extern double g_emitted_col_f64[64];
+extern uint32_t g_n_emitted_col_f64;
+extern char g_emitted_col_str_joined[256];
+extern uint32_t g_n_emitted_col_str;
 
 static void resetEmitted(void) {
 	g_n_emitted = 0;
 	g_gpu_path_taken = 0;
 	g_group_n = 0;
 	g_group_labels_joined[0] = '\0';
+	g_n_emitted_col_f64 = 0;
+	g_n_emitted_col_str = 0;
+	g_emitted_col_str_joined[0] = '\0';
 }
 
 static void test_init_and_basic_query(void) {
@@ -224,6 +231,57 @@ static void test_groupby_rejects_bad_input(void) {
 	CHECK(g_group_n == 0, "...and nothing was emitted");
 }
 
+static void test_emit_streams_full_numeric_column(void) {
+	resetEmitted();
+	double vals[] = {1, 2, 3, 4};
+	wc_load_column_f64("nums", vals, 4);
+
+	int rrc = wc_run("emit(col(\"nums\"));");
+	CHECK(rrc == 0, "wc_run succeeds");
+	CHECK(g_n_emitted_col_f64 == 4, "all 4 values were emitted, not summarized to one");
+	CHECK_DBL_EQ(g_emitted_col_f64[0], 1.0, "value 0 is correct");
+	CHECK_DBL_EQ(g_emitted_col_f64[3], 4.0, "value 3 is correct (order preserved)");
+}
+
+static void test_emit_streams_full_categorical_column_resolved(void) {
+	resetEmitted();
+	const char *categories = "a" "\x1f" "b" "\x1f" "a";
+	wc_load_column_str_dict("cats", categories, 3);
+
+	int rrc = wc_run("emit(col(\"cats\"));");
+	CHECK(rrc == 0, "wc_run succeeds");
+	/* Per-row resolved values, in row order - not the 2-entry dictionary
+	 * (a, b) columnDictJoined would give. */
+	CHECK(0 == strcmp(g_emitted_col_str_joined, "a" "\x1f" "b" "\x1f" "a"), "emitted values are per-row, resolved through the dictionary, in original row order");
+	CHECK(g_n_emitted_col_str == 3, "3 rows emitted, matching the source column's length");
+}
+
+static void test_groupby_count_only_form(void) {
+	resetEmitted();
+	const char *categories = "a" "\x1f" "b" "\x1f" "a" "\x1f" "c" "\x1f" "b" "\x1f" "a";
+	wc_load_column_str_dict("category3", categories, 6);
+
+	/* No numeric column needed for a plain per-category row count. */
+	int rrc = wc_run("groupby(col(\"category3\"));");
+	CHECK(rrc == 0, "1-arg groupby succeeds without a numeric column");
+	CHECK(g_group_n == 3, "3 distinct groups");
+	CHECK(0 == strcmp(g_group_agg, "count"), "1-arg form implies \"count\"");
+	CHECK_DBL_EQ(g_group_values[0], 3.0, "group 'a' count is correct");
+	CHECK_DBL_EQ(g_group_values[1], 2.0, "group 'b' count is correct");
+	CHECK_DBL_EQ(g_group_values[2], 1.0, "group 'c' count is correct");
+}
+
+static void test_groupby_rejects_two_args(void) {
+	resetEmitted();
+	const char *categories = "a" "\x1f" "b";
+	wc_load_column_str_dict("cat4", categories, 2);
+
+	/* 2-arg form (categorical + something, no explicit agg) is
+	 * deliberately unsupported rather than guessed at - see doGroupby. */
+	int rrc = wc_run("groupby(col(\"cat4\"), \"sum\");");
+	CHECK(rrc == -3, "groupby with exactly 2 args is a runtime error, not silently misinterpreted");
+}
+
 int main(void) {
 	test_init_and_basic_query();
 	test_sum_on_missing_column_is_a_runtime_error();
@@ -235,6 +293,10 @@ int main(void) {
 	test_str_dict_column_loads_and_dedupes();
 	test_groupby_aggregates_correctly();
 	test_groupby_rejects_bad_input();
+	test_emit_streams_full_numeric_column();
+	test_emit_streams_full_categorical_column_resolved();
+	test_groupby_count_only_form();
+	test_groupby_rejects_two_args();
 
 	printf("\n%d passed, %d failed\n", g_pass, g_fail);
 	return g_fail == 0 ? 0 : 1;

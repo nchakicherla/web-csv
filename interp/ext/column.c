@@ -160,16 +160,16 @@ uint32_t columnDictLen(const Column *col) {
 	return col->type == COL_STR_DICT ? col->dict_len : 0;
 }
 
-char *columnDictJoined(const Column *col) {
+/* Shared by columnDictJoined (n = dict_len distinct entries) and
+ * columnResolveJoined (n = len per-row resolved values) - same
+ * '\x1f'-join, different source array. */
+static char *joinStrings(const char *const *strs, uint32_t n) {
 	size_t total = 0;
 	char *out, *p;
 	uint32_t i;
 
-	if (col->type != COL_STR_DICT) {
-		return NULL;
-	}
-	for (i = 0; i < col->dict_len; i++) {
-		total += strlen(col->dict[i]) + 1; /* +1 for the '\x1f' separator or trailing '\0' */
+	for (i = 0; i < n; i++) {
+		total += strlen(strs[i]) + 1; /* +1 for the '\x1f' separator or trailing '\0' */
 	}
 	out = malloc(total ? total : 1);
 	if (!out) {
@@ -177,15 +177,43 @@ char *columnDictJoined(const Column *col) {
 	}
 
 	p = out;
-	for (i = 0; i < col->dict_len; i++) {
-		size_t len = strlen(col->dict[i]);
-		memcpy(p, col->dict[i], len);
+	for (i = 0; i < n; i++) {
+		size_t len = strlen(strs[i]);
+		memcpy(p, strs[i], len);
 		p += len;
-		*p++ = (i + 1 < col->dict_len) ? '\x1f' : '\0';
+		*p++ = (i + 1 < n) ? '\x1f' : '\0';
 	}
-	if (col->dict_len == 0) {
+	if (n == 0) {
 		out[0] = '\0';
 	}
+	return out;
+}
+
+char *columnDictJoined(const Column *col) {
+	if (col->type != COL_STR_DICT) {
+		return NULL;
+	}
+	return joinStrings((const char *const *)col->dict, col->dict_len);
+}
+
+char *columnResolveJoined(const Column *col) {
+	char **resolved;
+	char *out;
+	uint32_t i;
+
+	if (col->type != COL_STR_DICT) {
+		return NULL;
+	}
+	resolved = malloc(sizeof(char *) * (col->len ? col->len : 1));
+	if (!resolved) {
+		return NULL;
+	}
+	for (i = 0; i < col->len; i++) {
+		int32_t code = col->data.i32[i];
+		resolved[i] = (code >= 0 && (uint32_t)code < col->dict_len) ? col->dict[code] : "";
+	}
+	out = joinStrings((const char *const *)resolved, col->len);
+	free(resolved);
 	return out;
 }
 

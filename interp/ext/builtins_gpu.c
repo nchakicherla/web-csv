@@ -63,6 +63,25 @@ EM_JS(void, wcEmitGroups, (const char *labels_joined, double *values, uint32_t n
 	Module.wcResults.push({ type: 'groups', agg: UTF8ToString(agg_name), labels, values: vals });
 });
 
+/* emit()'s output channels for a whole column - see doEmit. Both push
+ * {type:'column', dtype, values} onto Module.wcResults, mirroring
+ * wcEmitGroups' shape so the frontend can tell result kinds apart by
+ * `type` rather than by guessing from JS typeof. */
+EM_JS(void, wcEmitNumberArray, (double *ptr, uint32_t len), {
+	const values = [];
+	for (let i = 0; i < len; i++) {
+		values.push(HEAPF64[(ptr >> 3) + i]);
+	}
+	Module.wcResults = Module.wcResults || [];
+	Module.wcResults.push({ type: 'column', dtype: 'f64', values });
+});
+
+EM_JS(void, wcEmitStringArray, (const char *values_joined, uint32_t len), {
+	const values = len === 0 ? [] : UTF8ToString(values_joined).split('\x1f');
+	Module.wcResults = Module.wcResults || [];
+	Module.wcResults.push({ type: 'column', dtype: 'string', values });
+});
+
 static bool doSum(Object *args, size_t n_args, Object *out, bool allow_gpu) {
 	Column *col;
 
@@ -147,49 +166,54 @@ static bool doFilterGt(Object *args, size_t n_args, Object *out) {
  * keeps every new concept (columns, the dictionary, emit) reused rather
  * than adding one more.
  *
- * Requires exactly 3 args and a numeric column even for "count", which
- * only needs categorical_col - simpler and more consistent than a
- * variable-arity signature, at the cost of the caller passing an
- * otherwise-unused numeric column just to count rows per category. */
+ * groupby(categorical_col) (1 arg) is a count-only shorthand - the only
+ * aggregate that doesn't need a numeric column at all, so it doesn't ask
+ * for one. 2 args is deliberately unsupported (rejected outright, not
+ * guessed at as "must mean count") since it's genuinely ambiguous
+ * whether the second argument was meant to be the numeric column (with
+ * agg implied) or the agg name (with the numeric column omitted) -
+ * exactly 1 or exactly 3 args, nothing in between. */
 static bool doGroupby(Object *args, size_t n_args, Object *out) {
-	Column *cat, *num;
-	const char *agg;
+	Column *cat, *num = NULL;
+	const char *agg = "count";
 	uint32_t n_groups, len, i, g;
 	int32_t *codes;
-	double *values;
+	double *values = NULL;
 	double *sums, *mins, *maxs, *result;
 	uint32_t *counts;
 	char *labels_joined;
 
-	if (n_args != 3) {
+	if (n_args != 1 && n_args != 3) {
 		return false;
 	}
+
 	cat = objAsColumn(args[0]);
-	num = objAsColumn(args[1]);
 	if (!cat || columnType(cat) != COL_STR_DICT) {
 		return false;
 	}
-	if (!num || columnType(num) != COL_F64) {
-		return false;
-	}
-	if (args[2].type != STR_TYPE) {
-		return false;
-	}
 
-	agg = args[2].val.str;
-	if (strcmp(agg, "sum") != 0 && strcmp(agg, "count") != 0 && strcmp(agg, "avg") != 0
-	    && strcmp(agg, "min") != 0 && strcmp(agg, "max") != 0) {
-		return false; /* unrecognized aggregate name */
+	if (n_args == 3) {
+		num = objAsColumn(args[1]);
+		if (!num || columnType(num) != COL_F64) {
+			return false;
+		}
+		if (args[2].type != STR_TYPE) {
+			return false;
+		}
+		agg = args[2].val.str;
+		if (strcmp(agg, "sum") != 0 && strcmp(agg, "count") != 0 && strcmp(agg, "avg") != 0
+		    && strcmp(agg, "min") != 0 && strcmp(agg, "max") != 0) {
+			return false; /* unrecognized aggregate name */
+		}
+		if (columnLen(num) != columnLen(cat)) {
+			return false; /* mismatched column lengths */
+		}
+		values = columnDataF64(num);
 	}
 
 	len = columnLen(cat);
-	if (columnLen(num) != len) {
-		return false; /* mismatched column lengths */
-	}
-
 	n_groups = columnDictLen(cat);
 	codes = columnDataI32(cat);
-	values = columnDataF64(num);
 
 	sums = calloc(n_groups ? n_groups : 1, sizeof(double));
 	counts = calloc(n_groups ? n_groups : 1, sizeof(uint32_t));
@@ -214,21 +238,23 @@ static bool doGroupby(Object *args, size_t n_args, Object *out) {
 		if (code < 0 || (uint32_t)code >= n_groups) {
 			continue;
 		}
-		sums[code] += values[i];
 		counts[code]++;
-		if (values[i] < mins[code]) {
-			mins[code] = values[i];
-		}
-		if (values[i] > maxs[code]) {
-			maxs[code] = values[i];
+		if (values) {
+			sums[code] += values[i];
+			if (values[i] < mins[code]) {
+				mins[code] = values[i];
+			}
+			if (values[i] > maxs[code]) {
+				maxs[code] = values[i];
+			}
 		}
 	}
 
 	for (g = 0; g < n_groups; g++) {
-		if (strcmp(agg, "sum") == 0) {
-			result[g] = sums[g];
-		} else if (strcmp(agg, "count") == 0) {
+		if (strcmp(agg, "count") == 0) {
 			result[g] = (double)counts[g];
+		} else if (strcmp(agg, "sum") == 0) {
+			result[g] = sums[g];
 		} else if (strcmp(agg, "avg") == 0) {
 			result[g] = counts[g] ? sums[g] / counts[g] : 0.0;
 		} else if (strcmp(agg, "min") == 0) {
@@ -259,11 +285,13 @@ EM_JS(void, wcEmitNumber, (double v), {
 	Module.wcResults.push(v);
 });
 
-/* emit(x) - the PoC's only channel back to JS for a value the UI should
- * show. A column argument is summarized (summed) rather than streamed back
- * whole; handing a full result column's buffer to JS for charting is a
- * real next step (expose its pointer/length the way wc_load_column_f64
- * ingests one), just not built here yet - see README's "Known gaps". */
+/* emit(x) - the PoC's channel back to JS for a value the UI should show.
+ * A numeric argument emits as a single number; a column argument streams
+ * every value (COL_F64 as numbers, COL_STR_DICT resolved back to its
+ * per-row strings) rather than being reduced to a summary - callers that
+ * want a summary already have sum()/groupby() for that, explicitly:
+ * emit(sum(col("amount"))) for a total, emit(col("amount")) for the whole
+ * column. */
 static bool doEmit(Object *args, size_t n_args, Object *out) {
 	if (n_args != 1) {
 		return false;
@@ -273,7 +301,13 @@ static bool doEmit(Object *args, size_t n_args, Object *out) {
 	} else {
 		Column *col = objAsColumn(args[0]);
 		if (col && columnType(col) == COL_F64) {
-			wcEmitNumber(cpuSum(col));
+			wcEmitNumberArray(columnDataF64(col), columnLen(col));
+		} else if (col && columnType(col) == COL_STR_DICT) {
+			char *joined = columnResolveJoined(col);
+			if (joined) {
+				wcEmitStringArray(joined, columnLen(col));
+				free(joined);
+			}
 		}
 	}
 	*out = objNil();

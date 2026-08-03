@@ -27,8 +27,8 @@ interp/
                        tree by ext/Makefile
     column.h/.c          typed column type (f64 / i32 / dict-encoded string)
     store.h/.c            the session's named + tracked columns
-    builtins_gpu.h/.c     col()/sum()/gpu_sum()/filter_gt()/emit() - the
-                          interpreter's native-function hook implementation
+    builtins_gpu.h/.c     col()/sum()/gpu_sum()/filter_gt()/groupby()/
+                          emit() - the native-function hook implementation
     web_main.c            Emscripten entry point (wc_init/wc_run/...)
 
 server/             persistence API (saved queries, dashboards) + serves web/
@@ -108,20 +108,37 @@ optimization now, not a hopeful TODO: get the exact function list from
 by hand. Not done here since `ASYNCIFY=1` is already correct and this
 wasn't the ask.
 
-`groupby(cat_col, num_col, agg)` (sum/count/avg/min/max) is CPU-only -
-no GPU path yet, see the shader-scope note below. It also doesn't return a
-value the way `sum`/`filter_gt` do: since a grouped result is naturally
-*two* parallel arrays (labels from the categorical column's dictionary,
-one aggregate per group) and the interpreter's `Object` has no type that
-carries a pair like that, `groupby` instead emits its result directly -
-`wcEmitGroups`, an `EM_JS` import that decodes the `\x1f`-joined label
-string (`UTF8ToString(...).split('\x1f')`) and pushes
+`groupby(cat_col, num_col, agg)` (sum/count/avg/min/max), or
+`groupby(cat_col)` alone for a count-only shorthand that doesn't need a
+numeric column at all - is CPU-only, no GPU path yet, see the
+shader-scope note below. (2-arg `groupby` is deliberately rejected rather
+than guessed at: it's genuinely ambiguous whether the second argument was
+meant to be the numeric column with `agg` implied, or the `agg` name with
+the numeric column omitted.) It also doesn't return a value the way
+`sum`/`filter_gt` do: since a grouped result is naturally *two* parallel
+arrays (labels from the categorical column's dictionary, one aggregate
+per group) and the interpreter's `Object` has no type that carries a pair
+like that, `groupby` instead emits its result directly - `wcEmitGroups`,
+an `EM_JS` import that decodes the `\x1f`-joined label string
+(`UTF8ToString(...).split('\x1f')`) and pushes
 `{type:'groups', agg, labels, values}` onto `Module.wcResults`, the same
-array `emit()`'s plain numbers land in. That makes `groupby` an output
+array `emit()`'s results land in. That makes `groupby` an output
 operation like `print`/`emit`, not a pure function - `sum(groupby(...))`
 isn't a thing today. A dedicated result type would remove that limit; not
 built here since reusing `emit`'s existing output channel needed nothing
-new either in the interpreter or in `main.js`'s result handling.
+new either in the interpreter or in `main.js`'s result handling, and
+because that type is better designed once the dashboard UI defines what
+"chartable data" actually needs to look like.
+
+`emit()` itself streams a whole column now rather than summarizing it -
+`wcEmitNumberArray` for `COL_F64` (every value, in order), and
+`wcEmitStringArray` for `COL_STR_DICT` (every *row's* value, resolved
+through the dictionary via `columnResolveJoined` - not just the distinct
+dictionary entries `columnDictJoined` would give). Both push
+`{type:'column', dtype, values}`. A caller that wants a single summary
+number still has `sum()`/`groupby()` for that, explicitly - the old
+"a column just gets summed" shortcut `emit()` used to take was more
+surprising than useful once you could ask for the real thing.
 
 ## GPU shader library scope
 
@@ -228,6 +245,13 @@ math), a Node script against the real `emcc` build exercising the actual
 `wcEmitGroups`/`UTF8ToString` JS path, and the real browser/UI end to end
 - every category's sum in `groupby(col("category"), col("amount"), "sum")`
 against the sample CSV matched hand-computed values exactly.
+
+`emit()` streaming a full column and `groupby(cat_col)`'s count-only
+1-arg form were verified the same three ways again: `emit(col("category"))`
+against the sample CSV returned all 20 values in exact row order, and
+`groupby(col("category"))` returned per-category counts summing to 20 -
+both through the real browser/UI, not just the native suite or a Node
+script.
 
 Every item on README's "First build checklist" is now verified; what's
 left is the "Known gaps" list there and above, which are deliberate scope
