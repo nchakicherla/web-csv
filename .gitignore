@@ -12,6 +12,9 @@ dist/
 *.wasm.map
 interp/build/
 web/src/wasm/
+interp/ext/test/test_builtins
+interp/ext/test/test_builtins.dSYM/
+*.dSYM/
 
 # sqlite data (db.js runs in WAL mode, hence -shm/-wal alongside the .sqlite itself)
 server/data/*.sqlite

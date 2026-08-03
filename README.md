@@ -30,9 +30,12 @@ deliberately unbuilt.
 interp/vendor/repl2/   vendored repl2 core + one small patch (see VENDORED.md)
 interp/ext/            web-csv's C layer: column store, GPU-aware builtins,
                        the Emscripten entry point, and its build (Makefile)
+interp/ext/test/        native C tests + the Node/wasm smoke test
 resources/             grammar-csv.txt, the default query/scripting grammar
 web/                   browser UI, CSV parsing, WebGPU bridge
+web/src/csv/parse.test.js  CSV parser unit tests
 server/                persistence API (saved queries/dashboards) + static host
+server/test/             API integration tests
 docs/                  architecture notes
 ```
 
@@ -81,6 +84,30 @@ query in the textbox as-is: `filter_gt(col("amount"), 100)` then `sum`
 should return `8183.23`, and `gpu_sum(col("amount"))` (falls back to CPU
 at this size - see the eligibility gate in ARCHITECTURE.md) `8512.01`.
 Both are hand-checked and match what a real browser run actually returned.
+
+## Testing
+
+```bash
+make test
+```
+
+Runs everything: the native C suite (`interp/ext/test`, grammar/native-hook/
+column-store/builtin logic - no `emcc` needed, ~instant), a Node smoke test
+against the real `emcc` build (`wc_init`/`wc_run`, plus a forced-GPU-path
+check that Asyncify actually suspends/resumes around a real async
+boundary - skips itself with a clear message if `interp/ext`'s `make`
+hasn't been run yet), the CSV parser's unit tests, and the server's API
+integration tests (real Express + a throwaway SQLite file per run, needs
+`npm install` in `server/` first). Each suite also runs standalone - see
+the `Makefile` at the repo root for the individual targets
+(`test-c`/`test-wasm`/`test-web`/`test-server`).
+
+This locks in everything the "First build checklist" below verified by
+hand originally, as an automated regression suite - what it deliberately
+does *not* cover is the real WGSL shader/`GPUDevice` path, since that
+needs a real browser with WebGPU and there's no headless-browser-with-GPU
+setup in this repo (yet). That one stays a manual check; see the
+checklist's item 5.
 
 ## First build checklist
 

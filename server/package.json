@@ -6,7 +6,8 @@
 	"description": "Persistence API (saved queries/dashboards) + static host for web/. The compute path (CSV parsing, the WASM interpreter, WebGPU) runs entirely client-side and does not depend on this service - see ../docs/ARCHITECTURE.md.",
 	"scripts": {
 		"start": "node src/index.js",
-		"dev": "node --watch src/index.js"
+		"dev": "node --watch src/index.js",
+		"test": "node --test"
 	},
 	"dependencies": {
 		"better-sqlite3": "^11.3.0",
