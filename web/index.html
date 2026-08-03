@@ -23,9 +23,10 @@
 
 	<div class="row">
 		<label for="query">Query (grammar-csv.txt syntax):</label><br>
-		<textarea id="query" rows="6">let big := filter_gt(col("amount"), 100);
+		<textarea id="query" rows="7">let big := filter_gt(col("amount"), 100);
 emit(sum(big));
-emit(gpu_sum(col("amount")));</textarea>
+emit(gpu_sum(col("amount")));
+groupby(col("category"), col("amount"), "sum");</textarea>
 	</div>
 
 	<div class="row">

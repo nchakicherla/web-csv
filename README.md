@@ -2,11 +2,13 @@
 
 CSV analysis in the browser: upload a CSV, then query and transform it
 with [repl2](https://github.com/nchakicherla/repl2)'s configurable-grammar
-tree-walking interpreter, compiled to WASM. Parallelizable operations
-(currently: summing a numeric column) run as WebGPU compute shaders on
-eligible hardware, falling back to plain WASM otherwise. A small
-Node/SQLite service persists saved queries and dashboards; the compute
-path itself needs no backend.
+tree-walking interpreter, compiled to WASM. Numeric *and* categorical
+columns are supported (`col()`, `filter_gt()`, `groupby()` with
+sum/count/avg/min/max aggregates). Parallelizable operations (currently:
+summing a numeric column) run as WebGPU compute shaders on eligible
+hardware, falling back to plain WASM otherwise. A small Node/SQLite
+service persists saved queries and dashboards; the compute path itself
+needs no backend.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design, what's
 built vs. stubbed, and known gaps. This is a scaffold from an initial
@@ -80,10 +82,17 @@ queries/dashboards yet.
 
 [web/sample-data/transactions.csv](web/sample-data/transactions.csv) - 20
 rows, `id`/`amount`/`category` columns. Upload it and run the default
-query in the textbox as-is: `filter_gt(col("amount"), 100)` then `sum`
-should return `8183.23`, and `gpu_sum(col("amount"))` (falls back to CPU
-at this size - see the eligibility gate in ARCHITECTURE.md) `8512.01`.
-Both are hand-checked and match what a real browser run actually returned.
+query in the textbox as-is:
+
+- `filter_gt(col("amount"), 100)` then `sum` -> `8183.23`
+- `gpu_sum(col("amount"))` (falls back to CPU at this size - see the
+  eligibility gate in ARCHITECTURE.md) -> `8512.01`
+- `groupby(col("category"), col("amount"), "sum")` -> `{groceries: 177.1,
+  electronics: 1289.43, coffee: 62.23, rent: 2075.25, utilities: 580,
+  travel: 4328}` (emitted as `{type:'groups', labels, values}`, not a
+  plain object - see `agg` for which aggregate ran)
+
+All hand-checked and matching what a real browser run actually returned.
 
 ## Testing
 
@@ -146,6 +155,14 @@ with real WebGPU hardware:
    One real integration bug found and fixed: `web/src/api/client.js`
    never actually sent the `x-user-id` header `auth.js` requires, so the
    "Save query" button 401'd unconditionally - see "Bugs found".
+7. ✅ Categorical columns (`wc_load_column_str_dict`) and `groupby()`
+   (sum/count/avg/min/max) work correctly - verified three ways: the
+   native C suite (dictionary encoding, group aggregation math), a Node
+   script against the real `emcc` build exercising the actual
+   `wcEmitGroups`/`UTF8ToString` JS path, and the real browser/UI,
+   uploading the sample CSV's `category` column and running
+   `groupby(col("category"), col("amount"), "sum")` - every category's
+   sum matched hand-computed values exactly.
 
 ### Bugs found doing the above (all fixed)
 
@@ -170,16 +187,26 @@ with real WebGPU hardware:
 
 ## Known gaps
 
-- String/categorical columns are parsed (`web/src/csv/parse.js`) but not
-  loaded into the interpreter's column store - only `wc_load_column_f64`
-  exists. `COL_STR_DICT` is implemented C-side (`column.c`/`store.c`);
-  it just has no JS-facing loader yet.
-- `emit()` on a column argument summarizes it (sums it) rather than
-  streaming the whole column back to JS - real chart-from-a-result-column
-  support needs a pointer/length export like `wc_load_column_f64`'s
-  counterpart, in reverse.
-- Only `sum` has a GPU path. `filter_gt` is CPU-only; GPU filter/groupby/
-  sort/join are all future work (see ARCHITECTURE.md's shader-scope note).
+- `emit()` on a plain (non-categorical) column argument summarizes it
+  (sums it) rather than streaming the whole column back to JS - real
+  chart-from-a-result-column support needs a pointer/length export like
+  `wc_load_column_f64`'s counterpart, in reverse.
+- Only `sum` has a GPU path. `filter_gt`/`groupby` are CPU-only; GPU
+  filter/groupby/sort/join are all future work (see ARCHITECTURE.md's
+  shader-scope note).
+- `groupby(cat_col, num_col, agg)` requires a numeric column even for
+  `"count"`, which doesn't use its values - a `count_by(cat_col)`
+  convenience wrapper is a reasonable follow-up, not built to keep the
+  builtin surface small for now.
+- `groupby()`'s dictionary build (`columnCreateStrDict`) is an O(n *
+  distinct_values) linear scan against the dict-so-far, not a hash table -
+  fine for a CSV's worth of categories (tens to low hundreds), not for
+  high-cardinality columns.
+- `groupby()` emits its result directly rather than returning a value the
+  script can keep composing with (same role `print`/`emit` already have) -
+  `sum(groupby(...))` isn't a thing. A dedicated result type that could
+  carry labels alongside values would remove this limitation, at the cost
+  of more machinery than a first pass needs.
 - `ASYNCIFY=1` instruments the whole interpreter rather than the narrower
   `ASYNCIFY_ONLY` call path - fine for correctness, worth tightening once
   there's a real build to derive the exact list from.

@@ -1,14 +1,9 @@
 // parse.js - CSV text -> typed columns.
 //
-// Only numeric ("f64") columns are wired into the WASM column store today
-// (see main.js's loadColumn / interp/ext/web_main.c's wc_load_column_f64,
-// which is f64-only). String columns are still parsed and returned here -
-// the type inference and column shape are ready for them - but there's no
-// wc_load_column_str_dict entry point yet to push them into the
-// interpreter's store (column.c/store.c already support COL_STR_DICT on
-// the C side; only the JS-facing loader is missing). A natural next step,
-// not built here to keep this scaffold's scope honest about what's wired
-// end to end vs. what's stubbed.
+// A column is either 'f64' (numeric) or 'string' (everything else -
+// dictionary-encoded on the way into the interpreter's column store, see
+// main.js's loadStringColumn / interp/ext/web_main.c's
+// wc_load_column_str_dict / column.c's columnCreateStrDict).
 
 export function parseCsv(text) {
 	const lines = text.split(/\r\n|\n/).filter((l) => l.length > 0);

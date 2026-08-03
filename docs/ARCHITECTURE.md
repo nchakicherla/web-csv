@@ -55,11 +55,14 @@ independent of any one script run's arena. The interpreter wraps a
 (`objColumn`/`objAsColumn`) so a native builtin can accept a column
 argument without repl2's `object.h` needing to know columns exist.
 
-**Gap:** `wc_load_column_f64` (web_main.c) is the only JS-facing loader.
-`COL_STR_DICT` exists on the C side (column.c/store.c) but has no JS entry
-point yet - `parse.js` infers and returns string columns, they just aren't
-pushed into the WASM store. A `wc_load_column_str_dict` export is the
-natural next addition.
+`wc_load_column_str_dict` (web_main.c) is the categorical counterpart to
+`wc_load_column_f64`: it takes a `\x1f`-joined string of raw values (see
+column.h's `columnDictJoined` for why that delimiter - ordinary CSV text
+essentially never contains it) and `columnCreateStrDict` (column.c) builds
+the dictionary itself, assigning each distinct value the next free code in
+first-seen order. That's an O(n * distinct_values) linear scan against the
+dict-so-far, not a hash table - fine for a CSV's worth of categories, a
+reasonable upgrade if a column turns out to be high-cardinality.
 
 ## Grammar/DSL layer
 
@@ -82,9 +85,9 @@ not just a new grammar file, and isn't attempted in this scaffold.
 ## Builtin bridge (interpreter <-> GPU) + Asyncify scoping
 
 `interp/ext/builtins_gpu.c` registers `col`, `sum`, `gpu_sum`, `filter_gt`,
-`emit` through the native-function hook (`interpSetNativeHook`, patched
-into vendored `interp.c`/`interp.h` - see `vendor/VENDORED.md` for exactly
-what changed and why). `sum` is a synchronous CPU loop. `gpu_sum` is the
+`groupby`, `emit` through the native-function hook (`interpSetNativeHook`,
+patched into vendored `interp.c`/`interp.h` - see `vendor/VENDORED.md` for
+exactly what changed and why). `sum` is a synchronous CPU loop. `gpu_sum` is the
 one actual async boundary: above `WC_GPU_MIN_LEN` elements, on an f64
 column, when `navigator.gpu` resolves, it calls `wcGpuReduceSum` - an
 `EM_ASYNC_JS` import whose body is `await Module.gpuBridge.reduceSum(...)`
@@ -105,15 +108,32 @@ optimization now, not a hopeful TODO: get the exact function list from
 by hand. Not done here since `ASYNCIFY=1` is already correct and this
 wasn't the ask.
 
+`groupby(cat_col, num_col, agg)` (sum/count/avg/min/max) is CPU-only -
+no GPU path yet, see the shader-scope note below. It also doesn't return a
+value the way `sum`/`filter_gt` do: since a grouped result is naturally
+*two* parallel arrays (labels from the categorical column's dictionary,
+one aggregate per group) and the interpreter's `Object` has no type that
+carries a pair like that, `groupby` instead emits its result directly -
+`wcEmitGroups`, an `EM_JS` import that decodes the `\x1f`-joined label
+string (`UTF8ToString(...).split('\x1f')`) and pushes
+`{type:'groups', agg, labels, values}` onto `Module.wcResults`, the same
+array `emit()`'s plain numbers land in. That makes `groupby` an output
+operation like `print`/`emit`, not a pure function - `sum(groupby(...))`
+isn't a thing today. A dedicated result type would remove that limit; not
+built here since reusing `emit`'s existing output channel needed nothing
+new either in the interpreter or in `main.js`'s result handling.
+
 ## GPU shader library scope
 
 `web/src/gpu/shaders/reduce_sum.wgsl` - a two-stage parallel reduction
 (per-workgroup partial sums on GPU, final add of the small partials array
 on CPU) - is the only shader in this scaffold. Filter (predicate -> mask)
-is the next straightforward one. Sort and hash-join are real engineering
-effort (bitonic sort network, GPU hash join are established techniques,
-not quick additions) and are out of scope here; the CPU path covers those
-operations until then.
+is the next straightforward one; a GPU groupby would build on the same
+segmented-reduce idea reduce_sum.wgsl already uses, keyed by category code
+instead of summing everything into one bucket. Sort and hash-join are real
+engineering effort (bitonic sort network, GPU hash join are established
+techniques, not quick additions) and are out of scope here; the CPU path
+covers all of these operations until then.
 
 **WGSL has no f64.** Its core numeric types are f32/i32/u32. `bridge.js`
 downcasts an f64 column to f32 before upload, which is a real precision
@@ -194,6 +214,21 @@ SQLite file with correct per-user isolation. One more real bug turned up
 here - `client.js` never actually sent the `x-user-id` header `auth.js`'s
 stub requires, so the UI's "Save query" button 401'd unconditionally,
 silently - fixed by generating a stable per-browser dev identity in
-`localStorage`. Every item on README's "First build checklist" is now
-verified; what's left is the "Known gaps" list there and above, which are
-deliberate scope cuts, not open questions about whether things work.
+`localStorage`.
+
+An automated test suite (`make test` - `interp/ext/test`'s native C
+suite, a Node smoke test against the real `emcc` build, `parse.js`'s unit
+tests, `server/`'s API integration tests) now locks in all of the above as
+a regression suite rather than a one-time manual check - see README's
+"Testing".
+
+Categorical columns and `groupby` were verified the same three ways as
+everything else: the native C suite (dictionary encoding, aggregation
+math), a Node script against the real `emcc` build exercising the actual
+`wcEmitGroups`/`UTF8ToString` JS path, and the real browser/UI end to end
+- every category's sum in `groupby(col("category"), col("amount"), "sum")`
+against the sample CSV matched hand-computed values exactly.
+
+Every item on README's "First build checklist" is now verified; what's
+left is the "Known gaps" list there and above, which are deliberate scope
+cuts, not open questions about whether things work.

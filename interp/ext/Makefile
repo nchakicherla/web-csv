@@ -2,8 +2,9 @@
 # (../vendor/repl2/src) plus this directory's web-specific layer (column
 # store, GPU-aware builtins, the web_main.c entry point).
 #
-# Requires the Emscripten SDK (emcc) on PATH - not installed in the
-# sandbox this scaffold was written in, so this Makefile is untested.
+# Requires the Emscripten SDK (emcc) on PATH - verified against emcc 6.0.5
+# via emsdk (see README's Prerequisites), including a full real-browser
+# run with real WebGPU hardware.
 # Install: https://emscripten.org/docs/getting_started/downloads.html
 #
 #   make            build web/src/wasm/interp.{js,wasm}
@@ -27,13 +28,15 @@ GRAMMAR_DEFAULT = ../../resources/grammar-csv.txt
 CFLAGS = -Wall -Wextra -std=c11 -I$(VENDOR_SRC) -I$(EXT_SRC) -O2
 
 EXPORTED_FUNCS = \
-  _wc_init,_wc_load_column_f64,_wc_run,_wc_reset_session,_malloc,_free
+  _wc_init,_wc_load_column_f64,_wc_load_column_str_dict,_wc_run,_wc_reset_session,_malloc,_free
 
 # HEAPF64 has to be listed explicitly - main.js/loadColumn's
 # wasmModule.HEAPF64.set(...) (and bridge.js's read of it) would otherwise
 # be undefined, since typed-array heap views aren't exported by default.
+# UTF8ToString is what wcEmitGroups (builtins_gpu.c's groupby output path)
+# uses to decode the '\x1f'-joined label string it gets back.
 EXPORTED_RUNTIME = \
-  ccall,cwrap,FS,HEAPF64
+  ccall,cwrap,FS,HEAPF64,UTF8ToString
 
 # ASYNCIFY note: gpu_sum() (builtins_gpu.c) reaches an EM_ASYNC_JS import
 # (wcGpuReduceSum), so every function on the call path from wc_run() down

@@ -11,6 +11,8 @@
 #include <emscripten.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "parser.h"
 #include "interp.h"
@@ -45,6 +47,69 @@ int wc_init(const char *grammar_path) {
 EMSCRIPTEN_KEEPALIVE
 int wc_load_column_f64(const char *name, double *values, uint32_t len) {
 	Column *col = columnCreateF64(name, values, len);
+	if (!col) {
+		return 1;
+	}
+	storeSetNamed(name, col);
+	return 0;
+}
+
+/* Takes a `\x1f`-joined string of `n_values` raw string values (see
+ * column.h's columnDictJoined for why that delimiter) and dictionary-
+ * encodes it into a COL_STR_DICT column - the JS-facing loader
+ * column.c/store.c's C-side categorical support was missing (see
+ * ARCHITECTURE.md's "Gap" note, now closed). Replaces any existing
+ * column of the same name, same as wc_load_column_f64. */
+EMSCRIPTEN_KEEPALIVE
+int wc_load_column_str_dict(const char *name, const char *values_joined, uint32_t n_values) {
+	char *buf;
+	char **values;
+	char *p;
+	uint32_t i, idx;
+	Column *col;
+
+	if (n_values == 0) {
+		col = columnCreateStrDict(name, NULL, 0);
+		if (!col) {
+			return 1;
+		}
+		storeSetNamed(name, col);
+		return 0;
+	}
+
+	buf = malloc(strlen(values_joined) + 1);
+	if (!buf) {
+		return 1;
+	}
+	memcpy(buf, values_joined, strlen(values_joined) + 1);
+
+	values = malloc(n_values * sizeof(char *));
+	if (!values) {
+		free(buf);
+		return 1;
+	}
+	/* Safe default if values_joined turns out to have fewer separators
+	 * than n_values implies - an empty string beats reading uninitialized
+	 * memory. */
+	for (i = 0; i < n_values; i++) {
+		values[i] = "";
+	}
+
+	values[0] = buf;
+	idx = 1;
+	for (p = buf; *p != '\0'; p++) {
+		if (*p == '\x1f') {
+			*p = '\0';
+			if (idx < n_values) {
+				values[idx] = p + 1;
+			}
+			idx++;
+		}
+	}
+
+	col = columnCreateStrDict(name, (const char *const *)values, n_values);
+	free(values);
+	free(buf);
 	if (!col) {
 		return 1;
 	}

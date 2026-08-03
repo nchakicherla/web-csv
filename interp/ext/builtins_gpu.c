@@ -2,6 +2,7 @@
 #include "column.h"
 #include "store.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <emscripten.h>
@@ -45,6 +46,21 @@ EM_JS(int, wcGpuAvailable, (void), {
  * interp/ext/Makefile's ASYNCIFY note. */
 EM_ASYNC_JS(double, wcGpuReduceSum, (double *ptr, uint32_t len), {
 	return await Module.gpuBridge.reduceSum(ptr, len);
+});
+
+/* groupby's output channel: `labels_joined` is `\x1f`-separated (see
+ * column.h's columnDictJoined), `values` an n_groups-length f64 array in
+ * the same dictionary order. Pushes a {type:'groups', ...} object onto
+ * Module.wcResults, alongside whatever plain numbers emit() has pushed
+ * there - the frontend distinguishes by shape. */
+EM_JS(void, wcEmitGroups, (const char *labels_joined, double *values, uint32_t n_groups, const char *agg_name), {
+	const labels = UTF8ToString(labels_joined).split('\x1f');
+	const vals = [];
+	for (let i = 0; i < n_groups; i++) {
+		vals.push(HEAPF64[(values >> 3) + i]);
+	}
+	Module.wcResults = Module.wcResults || [];
+	Module.wcResults.push({ type: 'groups', agg: UTF8ToString(agg_name), labels, values: vals });
 });
 
 static bool doSum(Object *args, size_t n_args, Object *out, bool allow_gpu) {
@@ -120,6 +136,124 @@ static bool doFilterGt(Object *args, size_t n_args, Object *out) {
 	return true;
 }
 
+/* groupby(categorical_col, numeric_col, agg) -> aggregates numeric_col's
+ * values per group of categorical_col ("sum"/"count"/"avg"/"min"/"max"),
+ * one result per distinct category, and emits it directly as a
+ * {labels, values} pair rather than returning a value the script can keep
+ * composing with - same "it's an output operation" role print()/emit()
+ * already have, not a pure function. A dedicated result type/Column
+ * variant that could carry labels alongside values would be the
+ * alternative, but that's more machinery than a first pass needs; this
+ * keeps every new concept (columns, the dictionary, emit) reused rather
+ * than adding one more.
+ *
+ * Requires exactly 3 args and a numeric column even for "count", which
+ * only needs categorical_col - simpler and more consistent than a
+ * variable-arity signature, at the cost of the caller passing an
+ * otherwise-unused numeric column just to count rows per category. */
+static bool doGroupby(Object *args, size_t n_args, Object *out) {
+	Column *cat, *num;
+	const char *agg;
+	uint32_t n_groups, len, i, g;
+	int32_t *codes;
+	double *values;
+	double *sums, *mins, *maxs, *result;
+	uint32_t *counts;
+	char *labels_joined;
+
+	if (n_args != 3) {
+		return false;
+	}
+	cat = objAsColumn(args[0]);
+	num = objAsColumn(args[1]);
+	if (!cat || columnType(cat) != COL_STR_DICT) {
+		return false;
+	}
+	if (!num || columnType(num) != COL_F64) {
+		return false;
+	}
+	if (args[2].type != STR_TYPE) {
+		return false;
+	}
+
+	agg = args[2].val.str;
+	if (strcmp(agg, "sum") != 0 && strcmp(agg, "count") != 0 && strcmp(agg, "avg") != 0
+	    && strcmp(agg, "min") != 0 && strcmp(agg, "max") != 0) {
+		return false; /* unrecognized aggregate name */
+	}
+
+	len = columnLen(cat);
+	if (columnLen(num) != len) {
+		return false; /* mismatched column lengths */
+	}
+
+	n_groups = columnDictLen(cat);
+	codes = columnDataI32(cat);
+	values = columnDataF64(num);
+
+	sums = calloc(n_groups ? n_groups : 1, sizeof(double));
+	counts = calloc(n_groups ? n_groups : 1, sizeof(uint32_t));
+	mins = malloc(sizeof(double) * (n_groups ? n_groups : 1));
+	maxs = malloc(sizeof(double) * (n_groups ? n_groups : 1));
+	result = malloc(sizeof(double) * (n_groups ? n_groups : 1));
+	if (!sums || !counts || !mins || !maxs || !result) {
+		free(sums);
+		free(counts);
+		free(mins);
+		free(maxs);
+		free(result);
+		return false;
+	}
+	for (g = 0; g < n_groups; g++) {
+		mins[g] = HUGE_VAL;
+		maxs[g] = -HUGE_VAL;
+	}
+
+	for (i = 0; i < len; i++) {
+		int32_t code = codes[i];
+		if (code < 0 || (uint32_t)code >= n_groups) {
+			continue;
+		}
+		sums[code] += values[i];
+		counts[code]++;
+		if (values[i] < mins[code]) {
+			mins[code] = values[i];
+		}
+		if (values[i] > maxs[code]) {
+			maxs[code] = values[i];
+		}
+	}
+
+	for (g = 0; g < n_groups; g++) {
+		if (strcmp(agg, "sum") == 0) {
+			result[g] = sums[g];
+		} else if (strcmp(agg, "count") == 0) {
+			result[g] = (double)counts[g];
+		} else if (strcmp(agg, "avg") == 0) {
+			result[g] = counts[g] ? sums[g] / counts[g] : 0.0;
+		} else if (strcmp(agg, "min") == 0) {
+			result[g] = counts[g] ? mins[g] : 0.0;
+		} else {
+			result[g] = counts[g] ? maxs[g] : 0.0; /* "max", the only remaining validated option */
+		}
+	}
+
+	labels_joined = columnDictJoined(cat);
+	if (labels_joined) {
+		wcEmitGroups(labels_joined, result, n_groups, agg);
+		free(labels_joined);
+	}
+
+	free(sums);
+	free(counts);
+	free(mins);
+	free(maxs);
+	free(result);
+
+	*out = objNil();
+	return true;
+}
+
 EM_JS(void, wcEmitNumber, (double v), {
 	Module.wcResults = Module.wcResults || [];
 	Module.wcResults.push(v);
@@ -162,6 +296,9 @@ bool wcNativeDispatch(Interp *in, const char *name, size_t len, Object *args,
 	}
 	if (len == 9 && 0 == memcmp(name, "filter_gt", 9)) {
 		return doFilterGt(args, n_args, out);
+	}
+	if (len == 7 && 0 == memcmp(name, "groupby", 7)) {
+		return doGroupby(args, n_args, out);
 	}
 	if (len == 4 && 0 == memcmp(name, "emit", 4)) {
 		return doEmit(args, n_args, out);

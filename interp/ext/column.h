@@ -56,11 +56,29 @@ Column *columnCreateI32(const char *name, const int32_t *values, uint32_t len);
 Column *columnCreateStrDictOwned(const char *name, int32_t *codes, uint32_t len,
                                  char **dict, uint32_t dict_len);
 
+/* Builds the dictionary itself: scans `values` (len borrowed strings,
+ * copied - ownership stays with the caller), assigning each distinct
+ * value the next free code in first-seen order. O(len * distinct_values)
+ * - a linear scan against the dict-so-far rather than a hash table, which
+ * is fine for a CSV's worth of categories (tens to low hundreds) and not
+ * for high-cardinality columns; a hash table is a reasonable upgrade if
+ * that changes, not needed to be correct today. */
+Column *columnCreateStrDict(const char *name, const char *const *values, uint32_t len);
+
 void columnFree(Column *col);
 
 uint32_t columnLen(const Column *col);
 ColumnType columnType(const Column *col);
 const char *columnName(const Column *col);
+
+/* COL_STR_DICT only - 0 for any other type. */
+uint32_t columnDictLen(const Column *col);
+
+/* COL_STR_DICT only - the column's dictionary entries joined with '\x1f'
+ * (ASCII Unit Separator - ordinary CSV/category text essentially never
+ * contains it, so no escaping scheme is needed for the delimiter itself).
+ * Malloc'd, caller frees. NULL for any other column type. */
+char *columnDictJoined(const Column *col);
 
 /* NULL if `col` is not that type - callers should check columnType() first;
  * these are for the JS/EMSCRIPTEN_KEEPALIVE accessors and the CPU builtins,

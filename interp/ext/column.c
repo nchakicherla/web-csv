@@ -5,13 +5,13 @@
 
 #define WC_COLUMN_MAGIC 0x574c4331u /* "WLC1" */
 
-static char *dupName(const char *name) {
-	size_t len = strlen(name);
+static char *dupStr(const char *s) {
+	size_t len = strlen(s);
 	char *out = malloc(len + 1);
 	if (!out) {
 		return NULL;
 	}
-	memcpy(out, name, len + 1);
+	memcpy(out, s, len + 1);
 	return out;
 }
 
@@ -23,7 +23,7 @@ static Column *allocColumn(const char *name, ColumnType type, uint32_t len) {
 	col->magic = WC_COLUMN_MAGIC;
 	col->type = type;
 	col->len = len;
-	col->name = dupName(name);
+	col->name = dupStr(name);
 	return col;
 }
 
@@ -73,6 +73,61 @@ Column *columnCreateStrDictOwned(const char *name, int32_t *codes, uint32_t len,
 	return col;
 }
 
+Column *columnCreateStrDict(const char *name, const char *const *values, uint32_t len) {
+	int32_t *codes = malloc(sizeof(int32_t) * (len ? len : 1));
+	char **dict = NULL;
+	uint32_t dict_cap = 0, dict_len = 0;
+	uint32_t i, d;
+	Column *col;
+
+	if (!codes) {
+		return NULL;
+	}
+
+	for (i = 0; i < len; i++) {
+		int32_t code = -1;
+
+		for (d = 0; d < dict_len; d++) {
+			if (0 == strcmp(dict[d], values[i])) {
+				code = (int32_t)d;
+				break;
+			}
+		}
+
+		if (code < 0) {
+			if (dict_len == dict_cap) {
+				uint32_t new_cap = dict_cap ? dict_cap * 2 : 8;
+				char **grown = realloc(dict, new_cap * sizeof(char *));
+				if (!grown) {
+					for (d = 0; d < dict_len; d++) {
+						free(dict[d]);
+					}
+					free(dict);
+					free(codes);
+					return NULL;
+				}
+				dict = grown;
+				dict_cap = new_cap;
+			}
+			dict[dict_len] = dupStr(values[i]);
+			code = (int32_t)dict_len;
+			dict_len++;
+		}
+
+		codes[i] = code;
+	}
+
+	col = columnCreateStrDictOwned(name, codes, len, dict, dict_len);
+	if (!col) {
+		for (d = 0; d < dict_len; d++) {
+			free(dict[d]);
+		}
+		free(dict);
+		free(codes);
+	}
+	return col;
+}
+
 void columnFree(Column *col) {
 	if (!col) {
 		return;
@@ -99,6 +154,39 @@ ColumnType columnType(const Column *col) {
 
 const char *columnName(const Column *col) {
 	return col->name;
+}
+
+uint32_t columnDictLen(const Column *col) {
+	return col->type == COL_STR_DICT ? col->dict_len : 0;
+}
+
+char *columnDictJoined(const Column *col) {
+	size_t total = 0;
+	char *out, *p;
+	uint32_t i;
+
+	if (col->type != COL_STR_DICT) {
+		return NULL;
+	}
+	for (i = 0; i < col->dict_len; i++) {
+		total += strlen(col->dict[i]) + 1; /* +1 for the '\x1f' separator or trailing '\0' */
+	}
+	out = malloc(total ? total : 1);
+	if (!out) {
+		return NULL;
+	}
+
+	p = out;
+	for (i = 0; i < col->dict_len; i++) {
+		size_t len = strlen(col->dict[i]);
+		memcpy(p, col->dict[i], len);
+		p += len;
+		*p++ = (i + 1 < col->dict_len) ? '\x1f' : '\0';
+	}
+	if (col->dict_len == 0) {
+		out[0] = '\0';
+	}
+	return out;
 }
 
 double *columnDataF64(Column *col) {

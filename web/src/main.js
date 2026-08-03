@@ -42,7 +42,7 @@ async function init() {
 	}
 }
 
-function loadColumn(name, values) {
+function loadF64Column(name, values) {
 	const ptr = wasmModule._malloc(values.length * Float64Array.BYTES_PER_ELEMENT);
 	try {
 		wasmModule.HEAPF64.set(values, ptr >> 3);
@@ -56,6 +56,20 @@ function loadColumn(name, values) {
 		}
 	} finally {
 		wasmModule._free(ptr);
+	}
+}
+
+// '\x1f'-joined, matching wc_load_column_str_dict's expectation (see
+// web_main.c and column.c's columnCreateStrDict) - ccall's 'string' arg
+// type handles the UTF8 encoding itself, no manual malloc needed here.
+function loadStringColumn(name, values) {
+	const rc = wasmModule.ccall(
+		'wc_load_column_str_dict', 'number',
+		['string', 'string', 'number'],
+		[name, values.join('\x1f'), values.length],
+	);
+	if (rc !== 0) {
+		throw new Error(`failed to load column "${name}" (code ${rc})`);
 	}
 }
 
@@ -80,17 +94,18 @@ csvInput.addEventListener('change', async () => {
 	}
 	const text = await file.text();
 	const columns = parseCsv(text);
-	const numeric = columns.filter((c) => c.type === 'f64');
 
-	for (const col of numeric) {
-		loadColumn(col.name, col.values);
+	for (const col of columns) {
+		if (col.type === 'f64') {
+			loadF64Column(col.name, col.values);
+		} else {
+			loadStringColumn(col.name, col.values);
+		}
 	}
 
-	const skipped = columns.length - numeric.length;
-	setStatus(
-		`Loaded ${numeric.length} numeric column(s) from ${file.name}` +
-		(skipped ? ` (${skipped} non-numeric column(s) parsed but not loaded - see parse.js)` : '.'),
-	);
+	const numeric = columns.filter((c) => c.type === 'f64').length;
+	const categorical = columns.length - numeric;
+	setStatus(`Loaded ${numeric} numeric and ${categorical} categorical column(s) from ${file.name}.`);
 });
 
 runButton.addEventListener('click', async () => {
