@@ -229,8 +229,9 @@ onto `Module.wcResults`.
 
 `wc_run` returns; `runQuery` hands `wcResults` to `renderResults`
 ([`charts/render.js`](../web/src/charts/render.js)), which dispatches on
-each result's *shape*: a `groups` object becomes a bar chart, a bare
-number becomes a stat tile, a whole column becomes a table (§9).
+each result's *shape*: a `groups` object becomes a bar chart (or a line
+chart, if its labels look like a `date_part()` timeline), a bare number
+becomes a stat tile, a whole column becomes a table (§9).
 
 **Every layer in this project appears in that path**, which is why it's
 worth reading once before the sections below.
@@ -253,6 +254,8 @@ web/                      the browser app — no build step, plain ES modules
     gpu/shaders/*.wgsl       the compute shaders               (§8)
     charts/render.js        picks a chart form by result shape (§9)
     charts/bar.js            SVG bar chart
+    charts/line.js           SVG line chart (trend over time)      (§9)
+    charts/tooltip.js        hover tooltip shared by bar.js/line.js
     charts/stat.js           stat tile
     charts/table.js          table + every chart's table view
     charts/format.js         number formatting (+ .test.js)
@@ -729,8 +732,19 @@ produced it:
 | Result | Form | Why |
 |---|---|---|
 | a bare number | stat tile | one value has no axes to plot against |
-| `{type:'groups'}` | bar chart | comparing magnitude across categories |
+| `{type:'groups'}`, chronological labels | line chart | trend over time |
+| `{type:'groups'}`, otherwise | bar chart | comparing magnitude across categories |
 | `{type:'column'}` | table | row-level data has no natural chart form |
+
+"Chronological" is a shape check on the labels, not a flag the result
+itself carries: `looksChronological()` in `render.js` tests every label
+against `/^\d{4}(-\d{2}(-\d{2})?)?$/` — exactly the `"year"`/`"month"`/
+`"day"` formats `date_part()` produces (§8's date/time note), and
+deliberately *not* `"weekday"` (`"Mon"`.."Sun"`), which cycles rather than
+progresses and stays a bar chart. `groupby()`'s `{type:'groups'}` payload
+has no field saying "a date column made these labels" — nothing needs one,
+since a CSV column of literal `"2024-01"` strings grouped the ordinary way
+would correctly get the same line-chart treatment.
 
 The same dispatch serves both the query box and every dashboard tile,
 because a tile is just "a query, run, its results rendered."

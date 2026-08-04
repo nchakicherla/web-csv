@@ -132,6 +132,33 @@
 	font-weight: 600;
 }
 
+/* --- line chart --- */
+
+.viz-line {
+	stroke: var(--series-1);
+	stroke-width: 2;
+}
+
+.viz-line-point {
+	fill: var(--series-1);
+}
+
+.viz-line-hit {
+	fill: transparent;
+	cursor: pointer;
+}
+
+.viz-line-hit:hover + .viz-line-point,
+.viz-line-hit:focus + .viz-line-point {
+	fill: var(--series-1);
+	filter: brightness(1.12);
+	r: 5;
+}
+
+.viz-line-hit:focus {
+	outline: none;
+}
+
 .viz-tooltip {
 	position: absolute;
 	pointer-events: none;

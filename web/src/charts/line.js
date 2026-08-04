@@ -1,39 +1,18 @@
-// bar.js - a hand-rolled SVG bar chart for a single-series magnitude
-// comparison (one aggregate value per category - a groupby() result).
-// Sequential single-hue color per the dataviz skill's choosing-a-form.md
-// ("compare magnitude" -> sequential, one hue), not per-category color -
-// there's no series identity here to encode, just one measure per bar.
-//
-// No chart library: this project has no build step for web/ (plain ES
-// modules), so charts are plain SVG + DOM, styled entirely through
-// theme.css's CSS custom properties (see that file for the palette
-// source - the dataviz skill's reference palette).
+// line.js - a hand-rolled SVG line chart for a single-series trend over
+// time: a groupby(date_part(...)) result whose labels are chronological
+// "YYYY"/"YYYY-MM"/"YYYY-MM-DD" strings, not an arbitrary category name -
+// see render.js's looksChronological() for the detection rule and
+// interp/ext/datetime.c's wcFormatDatePart for the exact label formats
+// this matches. Same chrome/margins/gridline conventions as bar.js so the
+// two forms read as the same chart family - just a different mark for a
+// different comparison (trend over time vs. magnitude across categories -
+// choosing-a-form.md).
 
 import { niceMax, formatTick, formatCompact } from './format.js';
 import { buildTable } from './table.js';
 import { showTooltip, hideTooltip } from './tooltip.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
-
-// A bar with rounded top corners, square at the baseline (marks-and-
-// anatomy.md's data-end spec) - a plain <rect> can't do one-sided
-// rounding, hence a path.
-function roundedTopBarPath(x, yTop, w, h, r) {
-	const yBottom = yTop + h;
-	if (h <= 0) {
-		return `M ${x} ${yBottom} L ${x + w} ${yBottom} Z`;
-	}
-	r = Math.min(r, w / 2, h);
-	return [
-		`M ${x} ${yBottom}`,
-		`L ${x} ${yTop + r}`,
-		`Q ${x} ${yTop} ${x + r} ${yTop}`,
-		`L ${x + w - r} ${yTop}`,
-		`Q ${x + w} ${yTop} ${x + w} ${yTop + r}`,
-		`L ${x + w} ${yBottom}`,
-		'Z',
-	].join(' ');
-}
 
 function svgEl(tag, attrs) {
 	const el = document.createElementNS(SVG_NS, tag);
@@ -43,17 +22,24 @@ function svgEl(tag, attrs) {
 	return el;
 }
 
-// A label that won't fit doesn't get clipped (marks-and-anatomy.md) -
-// this is the "measure first" call for the category axis: past a handful
-// of bars there's no room for full names, so shorten rather than let SVG
-// silently overflow into neighbors. Full names stay reachable in the
-// table-view twin and the tooltip either way.
-function truncateLabel(label, barCount) {
-	const budget = barCount <= 6 ? 12 : barCount <= 12 ? 8 : 5;
-	return label.length > budget ? `${label.slice(0, budget - 1)}…` : label;
+// Past a handful of points there's no room for every x-axis label without
+// overlap - the same "measure first, don't let SVG silently overflow"
+// rule bar.js's truncateLabel follows, but for point density rather than
+// string length: show every Nth label instead of shortening each one.
+function xLabelStride(n) {
+	if (n <= 8) {
+		return 1;
+	}
+	if (n <= 16) {
+		return 2;
+	}
+	if (n <= 31) {
+		return 4;
+	}
+	return Math.ceil(n / 8);
 }
 
-export function renderBarChart(container, { title, labels, values }) {
+export function renderLineChart(container, { title, labels, values }) {
 	container.innerHTML = '';
 
 	const root = document.createElement('div');
@@ -69,7 +55,7 @@ export function renderBarChart(container, { title, labels, values }) {
 	if (!labels.length) {
 		const empty = document.createElement('p');
 		empty.className = 'viz-table-note';
-		empty.textContent = 'No groups to show.';
+		empty.textContent = 'No data points to show.';
 		root.appendChild(empty);
 		container.appendChild(root);
 		return;
@@ -96,20 +82,21 @@ export function renderBarChart(container, { title, labels, values }) {
 	const plotW = width - marginLeft - marginRight;
 	const plotH = height - marginTop - marginBottom;
 
+	const n = values.length;
+	// 0-based axis, the same convention bar.js uses - and the same known
+	// limitation: a series with a negative value (a net-refund month, say)
+	// would sit below a baseline this scale doesn't extend to accommodate.
+	// Not handled here any more than it is in bar.js - see README's "Known
+	// gaps".
 	const maxVal = Math.max(0, ...values);
 	const axisMax = niceMax(maxVal || 1);
-	const n = values.length;
-	const slot = plotW / n;
-	const barGap = 2;
-	const barWidth = Math.max(1, Math.min(24, slot - barGap));
-	const showDirectLabels = n <= 12;
 
 	const svg = svgEl('svg', {
 		viewBox: `0 0 ${width} ${height}`,
 		width: '100%',
 		height,
 		role: 'img',
-		'aria-label': title || 'Bar chart',
+		'aria-label': title || 'Line chart',
 	});
 
 	// Gridlines at 0 / half / max - clean numbers, per marks-and-anatomy.md.
@@ -124,20 +111,26 @@ export function renderBarChart(container, { title, labels, values }) {
 		svg.appendChild(tickLabel);
 	}
 
+	// n===1 has no "between" to draw a line across - still plots the one
+	// point (centered), just no <path>.
+	const xAt = (i) => (n === 1 ? marginLeft + plotW / 2 : marginLeft + (i / (n - 1)) * plotW);
+	const yAt = (v) => marginTop + plotH - (axisMax > 0 ? (v / axisMax) * plotH : 0);
+
+	if (n > 1) {
+		const d = values.map((v, i) => `${i === 0 ? 'M' : 'L'} ${xAt(i)} ${yAt(v)}`).join(' ');
+		svg.appendChild(svgEl('path', { class: 'viz-line', d, fill: 'none' }));
+	}
+
+	const stride = xLabelStride(n);
 	values.forEach((v, i) => {
-		const barH = axisMax > 0 ? (v / axisMax) * plotH : 0;
-		const x = marginLeft + i * slot + (slot - barWidth) / 2;
-		const yTop = marginTop + plotH - barH;
+		const x = xAt(i);
+		const y = yAt(v);
 		const label = labels[i] ?? '';
 
-		// Hit target bigger than the mark (interaction.md): the full
-		// column slot, not just the painted bar width.
-		const hit = svgEl('rect', {
-			class: 'viz-bar-hit',
-			x: marginLeft + i * slot, y: marginTop, width: slot, height: plotH,
-			tabindex: '0',
-		});
-		const bar = svgEl('path', { class: 'viz-bar', d: roundedTopBarPath(x, yTop, barWidth, barH, 4) });
+		// Hit target bigger than the mark (interaction.md): a generous
+		// invisible circle around each point, not just the 3px dot itself.
+		const hit = svgEl('circle', { class: 'viz-line-hit', cx: x, cy: y, r: 10, tabindex: '0' });
+		const point = svgEl('circle', { class: 'viz-line-point', cx: x, cy: y, r: 3 });
 
 		const onShow = (evt) => showTooltip(evt.pageX ?? 0, evt.pageY ?? 0, label, v);
 		hit.addEventListener('pointerenter', onShow);
@@ -150,21 +143,17 @@ export function renderBarChart(container, { title, labels, values }) {
 		hit.addEventListener('blur', hideTooltip);
 
 		svg.appendChild(hit);
-		svg.appendChild(bar);
+		svg.appendChild(point);
 
-		if (showDirectLabels) {
-			const valLabel = svgEl('text', { class: 'viz-value-label', x: x + barWidth / 2, y: yTop - 4, 'text-anchor': 'middle' });
-			valLabel.textContent = formatCompact(v);
-			svg.appendChild(valLabel);
+		if (i % stride === 0 || i === n - 1) {
+			const xLabel = svgEl('text', { class: 'viz-category-label', x, y: marginTop + plotH + 14, 'text-anchor': 'middle' });
+			xLabel.textContent = label;
+			svg.appendChild(xLabel);
 		}
-
-		const catLabel = svgEl('text', { class: 'viz-category-label', x: x + barWidth / 2, y: marginTop + plotH + 14, 'text-anchor': 'middle' });
-		catLabel.textContent = truncateLabel(label, n);
-		svg.appendChild(catLabel);
 	});
 
 	chartWrap.appendChild(svg);
-	tableWrap.appendChild(buildTable(['Category', 'Value'], labels.map((l, i) => [l, formatCompact(values[i])])));
+	tableWrap.appendChild(buildTable(['Date', 'Value'], labels.map((l, i) => [l, formatCompact(values[i])])));
 
 	toggleBtn.addEventListener('click', () => {
 		const switchingToTable = tableWrap.hidden;

@@ -154,6 +154,30 @@ meaningful) rather than silently returning whatever `cpuSum()`'s
 unrecognized-type fallback would - see `interp/ext/test/test_builtins.c`'s
 `test_sum_rejects_date_columns`.
 
+### Charting a trend over time
+
+`groupby(date_part(col("date"), "month"), col("amount"), "sum")` (the
+default query's last line) now renders as a **line chart**, not a bar
+chart - `web/src/charts/line.js`, dispatched by
+`web/src/charts/render.js`'s `looksChronological()`. The detection is a
+shape check on the labels themselves (every label matches
+`/^\d{4}(-\d{2}(-\d{2})?)?$/` - a `date_part()` `"year"`/`"month"`/`"day"`
+output, not `"weekday"`, which is cyclic/categorical rather than a
+timeline and stays a bar chart), not a flag carried by the `{type:'groups'}`
+result - `groupby()`'s output doesn't know whether `date_part()` produced
+its categorical input or a CSV column of literal `"2024-01"` strings did,
+and it doesn't need to: either one is a real timeline and should render
+the same way.
+
+Same chrome as the bar chart (gridlines, hover tooltip, "View as table"
+toggle, `theme.css` tokens) so the two read as one chart family - the
+tooltip logic itself is shared (`web/src/charts/tooltip.js`, factored out
+of `bar.js` when `line.js` needed the identical hover behavior for a
+different mark). Like the bar chart, the y-axis is always 0-based and
+doesn't extend below 0 for a series with a negative value (a net-refund
+month, say) - not handled, consistent with the same simplification the
+bar chart already makes.
+
 ### A larger CSV, to actually exercise the GPU path
 
 The 20-row file above can't clear `WC_GPU_MIN_LEN` (50,000 - see
@@ -352,6 +376,15 @@ with real WebGPU hardware:
     date column against a `date("...")` threshold correctly keeps only
     later dates; and `sum()` on a date column fails loudly rather than
     returning a silently meaningless 0.
+13. ✅ The line chart (`charts/line.js`) works end to end in a real
+    browser: the default query's `date_part()` + `groupby()` result
+    correctly renders as a line (not a bar), with working gridlines, hover
+    tooltip (verified via a real `PointerEvent` dispatch, not just visual
+    inspection), and a "View as table" toggle that shows the identical
+    values as the chart. Confirmed the *other* `groupby()` result in the
+    same query (grouped by ordinary `category` labels) still renders as a
+    bar chart, not a line - the shape-based dispatch correctly
+    distinguishes the two in the same page, same query run.
 
 ### Bugs found doing the above (all fixed)
 
@@ -396,15 +429,12 @@ rather than a TODO waiting to be picked up:
   dashboard, only "Remove" and re-add via the query box above. Editable
   tiles are a natural follow-up once the tile card has a reason to be more
   than a display.
-- Only three chart forms exist: stat tile (a bare number), bar chart (a
-  `groupby` result), and table (a raw column or the accessibility twin of
-  a bar chart). There's now a real date column type (`COL_DATE` -
-  `date()`/`date_part()`, see "Date/time columns" above) to plot against,
-  but no dedicated line/time-series chart yet - a `date_part()` +
-  `groupby()` result renders as an ordinary bar chart today (which is
-  arguably still the right form for a handful of monthly buckets; it stops
-  being the right form once "date range" means finer-grained points than a
-  bar chart reads well as).
+- Four chart forms exist: stat tile (a bare number), bar chart (a
+  `groupby` result over ordinary categories), line chart (a `groupby`
+  result over chronological `date_part()` labels - see "Charting a trend
+  over time" below), and table (a raw column, or the accessibility twin of
+  either chart). There's no scatter/histogram form, and no way to combine
+  two series on one chart - each result renders alone.
 - Loading a saved dashboard doesn't auto-run it (a deliberate choice: the
   CSV needs to be loaded first, and running immediately against nothing
   loaded would just error) - the user has to click "Run dashboard"
