@@ -1,7 +1,8 @@
 /* js_stubs.c - native stand-ins for what Emscripten's glue and
  * web/src/gpu/bridge.js provide in the real build: wcGpuAvailable(),
  * wcGpuReduceSum(), wcGpuReduceSumExact(), wcEmitNumber(), wcEmitGroups(),
- * wcEmitNumberArray(), and wcEmitStringArray() (all builtins_gpu.c). Lets
+ * wcEmitNumberArray(), wcEmitStringArray(), and wcEmitDateArray() (all
+ * builtins_gpu.c). Lets
  * test_builtins.c drive wc_init/wc_load_column_f64/
  * wc_load_column_str_dict/wc_run (web_main.c) exactly as the real entry
  * points, unmodified.
@@ -39,6 +40,8 @@ double g_emitted_col_f64[64];
 uint32_t g_n_emitted_col_f64 = 0;
 char g_emitted_col_str_joined[256];
 uint32_t g_n_emitted_col_str = 0;
+char g_emitted_col_date_joined[256];
+uint32_t g_n_emitted_col_date = 0;
 
 int wcGpuAvailable(void) {
 	return g_wc_gpu_available;
@@ -96,4 +99,10 @@ void wcEmitStringArray(const char *values_joined, uint32_t len) {
 	strncpy(g_emitted_col_str_joined, values_joined, sizeof(g_emitted_col_str_joined) - 1);
 	g_emitted_col_str_joined[sizeof(g_emitted_col_str_joined) - 1] = '\0';
 	g_n_emitted_col_str = len;
+}
+
+void wcEmitDateArray(const char *values_joined, uint32_t len) {
+	strncpy(g_emitted_col_date_joined, values_joined, sizeof(g_emitted_col_date_joined) - 1);
+	g_emitted_col_date_joined[sizeof(g_emitted_col_date_joined) - 1] = '\0';
+	g_n_emitted_col_date = len;
 }

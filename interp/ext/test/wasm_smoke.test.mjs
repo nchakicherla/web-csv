@@ -199,4 +199,37 @@ test('wasm build smoke test', { skip: built ? false : 'run `make` in interp/ext/
 		assert.ok(elapsed >= 45, `expected the real ~50ms bridge delay (got ${elapsed}ms)`);
 		assert.equal(mod.wcResults[0], Number(expectedCents) / 100);
 	});
+
+	await t.test('date columns load, format back to ISO strings, and compose with date_part()/groupby()/filter_gt()', async () => {
+		const mod = await createInterpModule({ locateFile });
+		const rc1 = mod.ccall('wc_init', 'number', ['string'], ['/resources/grammar-csv.txt']);
+		assert.equal(rc1, 0);
+
+		// Same UTC epoch seconds parse.js's date detection would produce for
+		// these ISO strings - hand-computed independently (Python's
+		// calendar.timegm), same values interp/ext/test/test_builtins.c's
+		// date tests use on the C side.
+		const dates = new Float64Array([1705276800, 1708387200, 1704067200]); // 2024-01-15, 2024-02-20, 2024-01-01
+		const ptr = mod._malloc(dates.length * 8);
+		mod.HEAPF64.set(dates, ptr >> 3);
+		const rc2 = mod.ccall('wc_load_column_date', 'number', ['string', 'number', 'number'], ['d', ptr, dates.length]);
+		mod._free(ptr);
+		assert.equal(rc2, 0);
+
+		mod.wcResults = [];
+		const run = mod.cwrap('wc_run', 'number', ['string'], { async: true });
+		const rc3 = await run(
+			'emit(col("d"));\n' +
+			'emit(date(\"2024-01-15\"));\n' +
+			'let recent := filter_gt(col(\"d\"), date(\"2024-01-10\"));\n' +
+			'emit(recent);\n' +
+			'groupby(date_part(col(\"d\"), \"month\"));\n'
+		);
+		assert.equal(rc3, 0);
+
+		assert.deepEqual(mod.wcResults[0], { type: 'column', dtype: 'date', values: ['2024-01-15', '2024-02-20', '2024-01-01'] });
+		assert.equal(mod.wcResults[1], 1705276800);
+		assert.deepEqual(mod.wcResults[2], { type: 'column', dtype: 'date', values: ['2024-01-15', '2024-02-20'] });
+		assert.deepEqual(mod.wcResults[3], { type: 'groups', agg: 'count', labels: ['2024-01', '2024-02'], values: [2, 1] });
+	});
 });

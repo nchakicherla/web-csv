@@ -63,6 +63,27 @@ function loadF64Column(name, values) {
 	}
 }
 
+// Same wire format as loadF64Column (parse.js's date detection has already
+// converted every value to UTC epoch seconds) - just routed to
+// wc_load_column_date instead, which tags the resulting column COL_DATE
+// rather than COL_F64 so date_part()/emit() format it back as a date.
+function loadDateColumn(name, values) {
+	const ptr = wasmModule._malloc(values.length * Float64Array.BYTES_PER_ELEMENT);
+	try {
+		wasmModule.HEAPF64.set(values, ptr >> 3);
+		const rc = wasmModule.ccall(
+			'wc_load_column_date', 'number',
+			['string', 'number', 'number'],
+			[name, ptr, values.length],
+		);
+		if (rc !== 0) {
+			throw new Error(`failed to load column "${name}" (code ${rc})`);
+		}
+	} finally {
+		wasmModule._free(ptr);
+	}
+}
+
 // '\x1f'-joined, matching wc_load_column_str_dict's expectation (see
 // web_main.c and column.c's columnCreateStrDict). The joined string is
 // allocated on the heap explicitly rather than passed as a ccall 'string'
@@ -115,14 +136,17 @@ csvInput.addEventListener('change', async () => {
 	for (const col of columns) {
 		if (col.type === 'f64') {
 			loadF64Column(col.name, col.values);
+		} else if (col.type === 'date') {
+			loadDateColumn(col.name, col.values);
 		} else {
 			loadStringColumn(col.name, col.values);
 		}
 	}
 
 	const numeric = columns.filter((c) => c.type === 'f64').length;
-	const categorical = columns.length - numeric;
-	setStatus(`Loaded ${numeric} numeric and ${categorical} categorical column(s) from ${file.name}.`);
+	const dates = columns.filter((c) => c.type === 'date').length;
+	const categorical = columns.length - numeric - dates;
+	setStatus(`Loaded ${numeric} numeric, ${dates} date, and ${categorical} categorical column(s) from ${file.name}.`);
 });
 
 runButton.addEventListener('click', async () => {

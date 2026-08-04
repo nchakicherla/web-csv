@@ -1,9 +1,11 @@
 #include "builtins_gpu.h"
 #include "column.h"
+#include "datetime.h"
 #include "store.h"
 
 #include <math.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <emscripten.h>
@@ -92,6 +94,68 @@ EM_JS(void, wcEmitStringArray, (const char *values_joined, uint32_t len), {
 	Module.wcResults.push({ type: 'column', dtype: 'string', values });
 });
 
+/* Same shape as wcEmitStringArray, but dtype 'date' - the values are
+ * already formatted "YYYY-MM-DD" ISO strings (see formatDateColumnJoined),
+ * not raw epoch seconds, so the frontend never needs its own copy of the
+ * civil-calendar math to display them. */
+EM_JS(void, wcEmitDateArray, (const char *values_joined, uint32_t len), {
+	const values = len === 0 ? [] : UTF8ToString(values_joined).split('\x1f');
+	Module.wcResults = Module.wcResults || [];
+	Module.wcResults.push({ type: 'column', dtype: 'date', values });
+});
+
+/* Shared by doDatePart (per-row labels for a new categorical column) and
+ * doEmit's COL_DATE branch (per-row labels streamed back to JS): formats
+ * every row of a COL_DATE column with wcFormatDatePart(unit) into one
+ * fixed-stride buffer. WC_DATE_BUF_STRIDE (24) comfortably covers every
+ * format wcFormatDatePart produces ("YYYY-MM-DD" is the longest, 10 chars
+ * + NUL) with room to spare, so a single pass with snprintf per row is
+ * enough - no need to measure first. Malloc'd, caller frees. NULL on
+ * allocation failure. */
+#define WC_DATE_BUF_STRIDE 24
+static char *formatDateColumnBufs(Column *col, const char *unit) {
+	uint32_t len = columnLen(col), i;
+	double *vals = columnDataF64(col);
+	char *bufs = malloc((size_t)(len ? len : 1) * WC_DATE_BUF_STRIDE);
+	if (!bufs) {
+		return NULL;
+	}
+	for (i = 0; i < len; i++) {
+		wcFormatDatePart(vals[i], unit, bufs + (size_t)i * WC_DATE_BUF_STRIDE, WC_DATE_BUF_STRIDE);
+	}
+	return bufs;
+}
+
+/* '\x1f'-joins formatDateColumnBufs' fixed-stride rows into one string, the
+ * same shape column.c's joinStrings produces for a categorical column -
+ * what doEmit needs to hand a COL_DATE column to wcEmitDateArray. Malloc'd,
+ * caller frees. NULL on allocation failure. */
+static char *formatDateColumnJoined(Column *col, const char *unit) {
+	uint32_t len = columnLen(col), i;
+	char *bufs = formatDateColumnBufs(col, unit);
+	char *out;
+	size_t cap, pos = 0;
+
+	if (!bufs) {
+		return NULL;
+	}
+	cap = (size_t)(len ? len : 1) * WC_DATE_BUF_STRIDE + 1;
+	out = malloc(cap);
+	if (!out) {
+		free(bufs);
+		return NULL;
+	}
+	for (i = 0; i < len; i++) {
+		int n = snprintf(out + pos, cap - pos, "%s%s", bufs + (size_t)i * WC_DATE_BUF_STRIDE, (i + 1 < len) ? "\x1f" : "");
+		pos += (size_t)n;
+	}
+	if (len == 0) {
+		out[0] = '\0';
+	}
+	free(bufs);
+	return out;
+}
+
 static bool doSum(Object *args, size_t n_args, Object *out, bool allow_gpu) {
 	Column *col;
 
@@ -99,7 +163,11 @@ static bool doSum(Object *args, size_t n_args, Object *out, bool allow_gpu) {
 		return false;
 	}
 	col = objAsColumn(args[0]);
-	if (!col) {
+	if (!col || columnType(col) == COL_DATE) {
+		/* Summing epoch seconds isn't a meaningful operation - fail loudly
+		 * (surfaces as a runtime error, same as sum() on a missing column)
+		 * rather than silently returning 0 the way cpuSum() would for any
+		 * column type it doesn't recognize. */
 		return false;
 	}
 
@@ -186,6 +254,71 @@ static bool doGpuSumExact(Object *args, size_t n_args, Object *out) {
 	return true;
 }
 
+/* date(str) -> epoch-seconds number, parsed from an ISO 8601 date (see
+ * datetime.h's wcParseDate). The scalar counterpart to a CSV-loaded
+ * COL_DATE column - lets a script build a threshold to compare a date
+ * column against, e.g. filter_gt(col("order_date"), date("2024-06-01")). */
+static bool doDate(Object *args, size_t n_args, Object *out) {
+	double epoch;
+
+	if (n_args != 1 || args[0].type != STR_TYPE) {
+		return false;
+	}
+	if (wcParseDate(args[0].val.str, &epoch) != 0) {
+		return false;
+	}
+	*out = objDbl(epoch);
+	return true;
+}
+
+/* date_part(date_col, unit) -> new categorical (COL_STR_DICT) column, one
+ * label per row, formatted from date_col per `unit` ("year"/"month"/
+ * "day"/"weekday" - see datetime.h). This is what makes a date column
+ * composable with groupby(), which needs a categorical column to group
+ * by: date_part(col("order_date"), "month") turns per-row dates into
+ * "2024-01"/"2024-02"/... labels groupby() can aggregate over, without a
+ * duplicate hand-maintained "month" column in the source CSV (see
+ * sample-data/generate.mjs's comment, now closed by this). */
+static bool doDatePart(Object *args, size_t n_args, Object *out) {
+	Column *col, *result;
+	char *bufs;
+	const char **ptrs;
+	uint32_t len, i;
+
+	if (n_args != 2) {
+		return false;
+	}
+	col = objAsColumn(args[0]);
+	if (!col || columnType(col) != COL_DATE || args[1].type != STR_TYPE
+	    || !wcIsValidDatePartUnit(args[1].val.str)) {
+		return false;
+	}
+
+	len = columnLen(col);
+	bufs = formatDateColumnBufs(col, args[1].val.str);
+	if (!bufs) {
+		return false;
+	}
+	ptrs = malloc(sizeof(char *) * (len ? len : 1));
+	if (!ptrs) {
+		free(bufs);
+		return false;
+	}
+	for (i = 0; i < len; i++) {
+		ptrs[i] = bufs + (size_t)i * WC_DATE_BUF_STRIDE;
+	}
+
+	result = columnCreateStrDict(columnName(col), ptrs, len);
+	free(ptrs);
+	free(bufs);
+	if (!result) {
+		return false;
+	}
+	storeTrack(result);
+	*out = objColumn(result);
+	return true;
+}
+
 static bool doCol(Object *args, size_t n_args, Object *out) {
 	Column *col;
 
@@ -198,22 +331,26 @@ static bool doCol(Object *args, size_t n_args, Object *out) {
 }
 
 /* filter_gt(col, threshold) -> new column of col's values > threshold.
- * f64 columns only, and the predicate is fixed rather than a passed-in
- * comparator - keeps this PoC's builtin surface small; a real query
- * language would want filter(col, expr) with the grammar's own comparison
- * operators, not a native function per predicate shape. */
+ * f64 and date columns only (both store as plain doubles - a date column's
+ * "threshold" is an epoch-seconds number, e.g. from date("2024-06-01")),
+ * and the predicate is fixed rather than a passed-in comparator - keeps
+ * this PoC's builtin surface small; a real query language would want
+ * filter(col, expr) with the grammar's own comparison operators, not a
+ * native function per predicate shape. */
 static bool doFilterGt(Object *args, size_t n_args, Object *out) {
 	Column *col, *result;
 	double threshold, *src, *dst;
 	uint32_t len, kept = 0;
+	bool is_date;
 
 	if (n_args != 2) {
 		return false;
 	}
 	col = objAsColumn(args[0]);
-	if (!col || columnType(col) != COL_F64 || !objIsNumber(args[1])) {
+	if (!col || (columnType(col) != COL_F64 && columnType(col) != COL_DATE) || !objIsNumber(args[1])) {
 		return false;
 	}
+	is_date = columnType(col) == COL_DATE;
 
 	threshold = objAsDouble(args[1]);
 	len = columnLen(col);
@@ -229,7 +366,7 @@ static bool doFilterGt(Object *args, size_t n_args, Object *out) {
 		}
 	}
 
-	result = columnCreateF64(columnName(col), dst, kept);
+	result = is_date ? columnCreateDate(columnName(col), dst, kept) : columnCreateF64(columnName(col), dst, kept);
 	free(dst);
 	if (!result) {
 		return false;
@@ -392,6 +529,12 @@ static bool doEmit(Object *args, size_t n_args, Object *out) {
 				wcEmitStringArray(joined, columnLen(col));
 				free(joined);
 			}
+		} else if (col && columnType(col) == COL_DATE) {
+			char *joined = formatDateColumnJoined(col, "day"); /* full "YYYY-MM-DD" per row */
+			if (joined) {
+				wcEmitDateArray(joined, columnLen(col));
+				free(joined);
+			}
 		}
 	}
 	*out = objNil();
@@ -423,6 +566,12 @@ bool wcNativeDispatch(Interp *in, const char *name, size_t len, Object *args,
 	}
 	if (len == 4 && 0 == memcmp(name, "emit", 4)) {
 		return doEmit(args, n_args, out);
+	}
+	if (len == 4 && 0 == memcmp(name, "date", 4)) {
+		return doDate(args, n_args, out);
+	}
+	if (len == 9 && 0 == memcmp(name, "date_part", 9)) {
+		return doDatePart(args, n_args, out);
 	}
 	return false;
 }

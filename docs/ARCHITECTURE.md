@@ -127,6 +127,13 @@ mid-call, wait on a JavaScript promise, and resume. See §7.
 one big block that is freed all at once, instead of being freed
 individually. repl2 uses one for parse trees.
 
+**Epoch seconds** — the number of seconds since 1970-01-01 00:00:00 UTC
+("the Unix epoch"), the same reference point `Date.now() / 1000` in
+JavaScript or Python's `time.time()` use. This codebase's date columns
+store dates this way (as an ordinary `f64`) rather than as text, so
+comparing or bucketing dates is just comparing numbers. See §5's `COL_DATE`
+and §8's date/time note.
+
 ---
 
 ## 3. One query, end to end
@@ -235,8 +242,9 @@ worth reading once before the sections below.
 ```
 web/                      the browser app — no build step, plain ES modules
   index.html               the page itself
-  sample-data/             transactions.csv (20 rows) and
-                           transactions-large.csv (100k, generate.mjs)
+  sample-data/             transactions.csv (20 rows, incl. a date
+                           column) and transactions-large.csv (100k,
+                           generate.mjs)
   src/
     csv/parse.js            CSV text -> typed columns          (§5)
     csv/parse.test.js        its unit tests
@@ -259,9 +267,11 @@ interp/                   the analysis engine, written in C
                              + one local patch (VENDORED.md)
   ext/                      web-csv's own C layer
     column.h/.c              the column type                    (§5)
+    datetime.h/.c            civil-calendar math for COL_DATE    (§5)
     store.h/.c               the session's live columns         (§5)
     builtins_gpu.h/.c        col/sum/gpu_sum/gpu_sum_exact/
-                             filter_gt/groupby/emit              (§7)
+                             filter_gt/groupby/date/date_part/
+                             emit                                 (§7)
     web_main.c               entry points JS calls (wc_run, …)
     Makefile                 the emcc build
     test/                    native C tests + a WASM smoke test  (§12)
@@ -309,7 +319,7 @@ This is not a web-csv invention: it is why pandas stores DataFrames as
 per-column NumPy arrays, why Parquet is a columnar file format, and why
 DuckDB is a columnar engine. web-csv just does it small enough to read.
 
-### The three column types
+### The four column types
 
 [`interp/ext/column.h`](../interp/ext/column.h):
 
@@ -318,6 +328,20 @@ DuckDB is a columnar engine. web-csv just does it small enough to read.
 | `COL_F64` | `double*` | numeric columns |
 | `COL_I32` | `int32_t*` | integer columns (defined, not yet produced by the CSV path) |
 | `COL_STR_DICT` | `int32_t*` codes + `char**` dictionary | text / categorical columns |
+| `COL_DATE` | `double*` (epoch seconds, UTC) | date / date-time columns |
+
+`COL_DATE` is physically identical to `COL_F64` — same `double*` storage,
+same `columnDataF64()` accessor returns it for both — it's a distinct *tag*
+so builtins can tell "a number" from "a date that happens to be stored as
+a number." That's not a wasted distinction: `sum()` refuses a `COL_DATE`
+column (summing epoch seconds isn't meaningful) where it would silently
+sum a `COL_F64` one, `date_part()` requires `COL_DATE` and rejects
+`COL_F64`, and `filter_gt()` accepts *both* (comparing epoch-seconds
+numbers is exactly comparing dates, so the same `>` predicate is correct
+for either). `interp/ext/datetime.c` holds the actual calendar math this
+type needs — parsing an ISO string to epoch seconds and formatting epoch
+seconds back to a calendar part (year/month/day/weekday) — kept separate
+from `column.c` because it's civil-calendar arithmetic, not storage.
 
 ### Dictionary encoding, concretely
 
@@ -448,9 +472,11 @@ function name:
 | `sum(col)` | CPU sum of a numeric column |
 | `gpu_sum(col)` | same, but eligible for the GPU path, f32, approximate (§8) |
 | `gpu_sum_exact(col)` | same GPU eligibility, integer cents, exact (§8) |
-| `filter_gt(col, n)` | new column of values greater than `n` |
+| `filter_gt(col, n)` | new column of values greater than `n` (numeric or date columns) |
 | `groupby(cat)` | count of rows per category |
 | `groupby(cat, num, agg)` | `sum`/`count`/`avg`/`min`/`max` per category |
+| `date(str)` | parse an ISO date string to epoch seconds |
+| `date_part(date_col, unit)` | new categorical column of per-row labels (`"year"`/`"month"`/`"day"`/`"weekday"`) |
 | `emit(x)` | send a value or a whole column back to JS |
 
 The hook is deliberately generic — it knows nothing about columns — so
@@ -652,6 +678,45 @@ bucket. Sort and hash-join are established but genuinely substantial
 techniques (bitonic sort networks, GPU hash joins) and are out of scope —
 the CPU covers all of these today.
 
+### Date/time columns
+
+Not a GPU feature — dates are ordinary CPU-side epoch-seconds doubles
+(`COL_DATE`, §5), and there's no `gpu_date_*` anything — but worth placing
+next to the two precision sections above, because it makes the same kind
+of "where does the number actually come from" decision they do.
+
+The epoch-seconds conversion happens **in JS**, not in the WASM build:
+`web/src/csv/parse.js` detects a date-shaped column (`DATE_RE`) and
+converts every cell with `Date.UTC(...)` on regex-captured
+year/month/day/hour/minute/second fields *before* the value ever reaches
+`wc_load_column_date`. `Date.parse()` is deliberately not used for this —
+per the ECMA-262 spec, a bare *date* string (`"2024-01-15"`) parses as
+UTC, but a *date-time* string with no explicit offset (`"2024-01-15T08:30"`)
+parses as the browser's **local** time zone. Relying on it would mean the
+same CSV silently loading different epoch values depending on where it's
+opened — exactly the kind of environment-dependent bug that's easy to
+miss in development (one machine, one time zone) and only shows up for a
+user somewhere else. Building the epoch value from explicit UTC fields
+sidesteps the ambiguity entirely, and it's also why `datetime.c`'s
+`wcParseDate` (which a script's own `date("...")` literal goes through)
+implements the identical UTC interpretation independently in C rather
+than calling any timezone-aware libc function — the two need to agree,
+and "no timezone concept at all" is the simplest way to guarantee that.
+
+The C-side calendar math (`interp/ext/datetime.c`) is Howard Hinnant's
+`days_from_civil`/`civil_from_days` algorithm — closed-form arithmetic
+that converts a (year, month, day) triple to a day count relative to the
+epoch and back, correct for any proleptic-Gregorian year without a lookup
+table or a loop. It's used both directions: `wcParseDate` (civil → epoch,
+for `date("...")`) and `wcFormatDatePart` (epoch → civil, for
+`date_part()` and for formatting a date column back to `"YYYY-MM-DD"` in
+`emit()`). `wcFormatDatePart` floors rather than truncates when dividing
+epoch seconds by 86400 specifically so a moment *before* the epoch
+(negative epoch seconds) lands on the correct prior day instead of
+rounding toward 1970-01-01 — exercised directly by
+`test_builtins.c`'s date test, which loads `-86400` (one day before the
+epoch) and checks it formats as `1969-12-31`, not `1970-01-01`.
+
 ---
 
 ## 9. Charts and the dashboard
@@ -742,6 +807,8 @@ oversight.
 | Dev-stub auth | real auth is the user's decision to make | unusable beyond localhost as-is |
 | Function-call DSL, not SQL | SQL needs new evaluator semantics, not just a grammar (§6) | less familiar syntax for analysts |
 | No chart library | `web/` has no build step; keeps deps at zero | chart features are hand-built |
+| Dates stored as epoch-seconds `f64` (`COL_DATE`), not a string/struct | comparing/bucketing dates becomes plain number comparison; reuses `COL_F64`'s storage and `filter_gt` unchanged | no timezone concept at all — every date is UTC, always (§8's date/time note) |
+| Date parsing done in JS (`parse.js`), not handed to WASM as raw strings | JS's `Date.UTC(...)` on regex-captured fields sidesteps `Date.parse()`'s spec-mandated local-time ambiguity for date-*time* strings | the C-side `wcParseDate` (for script `date(...)` literals) has to independently implement the same UTC interpretation, not share the JS logic |
 
 ---
 
@@ -782,6 +849,18 @@ dataset (`-300`) matched hand arithmetic exactly. Against
 `transactions-large.csv` it returned a clean `26559531.42`, where both
 `sum` (f64) and `gpu_sum` (f32) show floating-point noise of different
 kinds - see README's "A larger CSV".
+
+**Date/time columns**, in a real browser against both sample CSVs:
+`parse.js` correctly detected and converted the ISO `date` column in each,
+`date_part(col("date"), "month")` composed with `groupby()` produced the
+exact same per-month row counts as the hand-maintained `month` categorical
+column on the 100,000-row file — bucket for bucket, not just
+approximately — confirming the two really do derive the same grouping
+from the same underlying dates. `filter_gt()` against a `date("...")`
+threshold, `emit()` round-tripping a date column back to ISO strings
+(including a date before the Unix epoch, exercising `wcFormatDatePart`'s
+`floor()`), and `sum()` correctly refusing a date column were all also
+confirmed live, not just in the native/WASM test suites.
 
 **The full UI**, in a real browser: CSV upload through the actual file
 input, queries returning hand-checked values, each result shape rendering

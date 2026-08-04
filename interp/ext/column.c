@@ -44,6 +44,28 @@ Column *columnCreateF64(const char *name, const double *values, uint32_t len) {
 	return col;
 }
 
+/* Same physical layout as columnCreateF64 (epoch seconds, f64) - COL_DATE
+ * exists as a distinct tag so builtins can tell "a number" from "a date
+ * that happens to be stored as a number" (date_part() requires it,
+ * doSum() refuses it, doFilterGt() accepts both). See datetime.h for what
+ * the values mean. */
+Column *columnCreateDate(const char *name, const double *values, uint32_t len) {
+	Column *col = allocColumn(name, COL_DATE, len);
+	if (!col) {
+		return NULL;
+	}
+	col->data.f64 = malloc(sizeof(double) * (len ? len : 1));
+	if (!col->data.f64) {
+		free(col->name);
+		free(col);
+		return NULL;
+	}
+	if (len) {
+		memcpy(col->data.f64, values, sizeof(double) * len);
+	}
+	return col;
+}
+
 Column *columnCreateI32(const char *name, const int32_t *values, uint32_t len) {
 	Column *col = allocColumn(name, COL_I32, len);
 	if (!col) {
@@ -218,7 +240,7 @@ char *columnResolveJoined(const Column *col) {
 }
 
 double *columnDataF64(Column *col) {
-	return col->type == COL_F64 ? col->data.f64 : NULL;
+	return (col->type == COL_F64 || col->type == COL_DATE) ? col->data.f64 : NULL;
 }
 
 int32_t *columnDataI32(Column *col) {

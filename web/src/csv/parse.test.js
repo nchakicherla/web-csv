@@ -55,3 +55,41 @@ test('trims whitespace around values', () => {
 	assert.equal(columns[0].type, 'f64');
 	assert.equal(columns[0].values[0], 42);
 });
+
+test('detects a bare ISO date column and converts it to UTC epoch seconds', () => {
+	const columns = parseCsv('order_date,amount\n2024-01-15,10\n2024-02-20,20\n');
+	assert.equal(columns[0].type, 'date');
+	// Hand-computed with Python's calendar.timegm, independent of this
+	// codebase's own date math - see interp/ext/test/test_builtins.c's date
+	// tests for the same values used the same way on the C side.
+	assert.deepEqual(Array.from(columns[0].values), [1705276800, 1708387200]);
+	assert.equal(columns[1].type, 'f64');
+});
+
+test('detects a date+time column (T-separated) as UTC, not local time', () => {
+	const columns = parseCsv('ts\n2024-06-15T08:30:00\n');
+	assert.equal(columns[0].type, 'date');
+	assert.equal(columns[0].values[0], 1718440200);
+});
+
+test('a space-separated date+time is also detected, still as UTC', () => {
+	const columns = parseCsv('ts\n2024-06-15 08:30\n');
+	assert.equal(columns[0].type, 'date');
+	assert.equal(columns[0].values[0], 1718440200); // same clock time as the T-separated case above, seconds default to 0
+});
+
+test('treats an empty cell in a date column as NaN, not a string column', () => {
+	// A wholly-blank line would be dropped by parseCsv's line filter before
+	// this even reaches column classification, so the empty date cell needs
+	// a second, non-empty column on the same row to keep the row non-blank.
+	const columns = parseCsv('d,x\n2024-01-15,1\n,2\n');
+	assert.equal(columns[0].type, 'date');
+	assert.equal(columns[0].values[0], 1705276800);
+	assert.equal(Number.isNaN(columns[0].values[1]), true);
+});
+
+test('a column that merely looks date-shaped in one row but not another falls back to string', () => {
+	const columns = parseCsv('mixed\n2024-01-15\nnot-a-date\n');
+	assert.equal(columns[0].type, 'string');
+	assert.deepEqual(columns[0].values, ['2024-01-15', 'not-a-date']);
+});

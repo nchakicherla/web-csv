@@ -28,6 +28,7 @@ typedef enum {
 	COL_F64,
 	COL_I32,
 	COL_STR_DICT, /* per-row int32 codes into `dict` */
+	COL_DATE, /* epoch seconds (UTC), f64-stored - see datetime.h */
 } ColumnType;
 
 typedef struct s_Column {
@@ -48,6 +49,11 @@ typedef struct s_Column {
 
 Column *columnCreateF64(const char *name, const double *values, uint32_t len);
 Column *columnCreateI32(const char *name, const int32_t *values, uint32_t len);
+
+/* Same storage shape as columnCreateF64 (epoch seconds, UTC) but tagged
+ * COL_DATE - see datetime.h for what the values mean and column.c's
+ * comment for why this is a distinct type rather than reusing COL_F64. */
+Column *columnCreateDate(const char *name, const double *values, uint32_t len);
 
 /* Takes ownership of `codes` (must be malloc'd, len entries) and `dict`
  * (must be malloc'd, dict_len malloc'd strings) - both freed by

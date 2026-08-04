@@ -54,6 +54,23 @@ int wc_load_column_f64(const char *name, double *values, uint32_t len) {
 	return 0;
 }
 
+/* Same contract as wc_load_column_f64 (takes ownership of `values`, caller
+ * frees after this returns), but tags the column COL_DATE - `values` must
+ * already be epoch seconds (UTC), which is JS's job (parse.js's date
+ * detection + main.js's loadDateColumn use `Date.parse(v) / 1000`, not a
+ * raw string this function would need to parse itself). See datetime.h's
+ * wcParseDate for the equivalent parse a script-level date("...") literal
+ * goes through instead. */
+EMSCRIPTEN_KEEPALIVE
+int wc_load_column_date(const char *name, double *values, uint32_t len) {
+	Column *col = columnCreateDate(name, values, len);
+	if (!col) {
+		return 1;
+	}
+	storeSetNamed(name, col);
+	return 0;
+}
+
 /* Takes a `\x1f`-joined string of `n_values` raw string values (see
  * column.h's columnDictJoined for why that delimiter) and dictionary-
  * encodes it into a COL_STR_DICT column - the JS-facing loader

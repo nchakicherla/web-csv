@@ -32,6 +32,7 @@ static int g_pass = 0, g_fail = 0;
 extern int wc_init(const char *grammar_path);
 extern int wc_load_column_f64(const char *name, double *values, unsigned int len);
 extern int wc_load_column_str_dict(const char *name, const char *values_joined, uint32_t n_values);
+extern int wc_load_column_date(const char *name, double *values, unsigned int len);
 extern int wc_run(const char *source);
 
 /* js_stubs.c */
@@ -48,6 +49,8 @@ extern double g_emitted_col_f64[64];
 extern uint32_t g_n_emitted_col_f64;
 extern char g_emitted_col_str_joined[256];
 extern uint32_t g_n_emitted_col_str;
+extern char g_emitted_col_date_joined[256];
+extern uint32_t g_n_emitted_col_date;
 
 static void resetEmitted(void) {
 	g_n_emitted = 0;
@@ -58,6 +61,8 @@ static void resetEmitted(void) {
 	g_n_emitted_col_f64 = 0;
 	g_n_emitted_col_str = 0;
 	g_emitted_col_str_joined[0] = '\0';
+	g_n_emitted_col_date = 0;
+	g_emitted_col_date_joined[0] = '\0';
 }
 
 static void test_init_and_basic_query(void) {
@@ -321,6 +326,95 @@ static void test_gpu_sum_exact_above_threshold_matches_cpu_exactly(void) {
 	g_wc_gpu_available = 0;
 }
 
+static void test_date_column_round_trips_via_emit(void) {
+	resetEmitted();
+	/* Epoch seconds (UTC) for 2024-01-15, 2024-02-20, and 1969-12-31 (one
+	 * day *before* the epoch - the negative-epoch case exercises
+	 * wcFormatDatePart's floor(), not truncate, division). Hand-computed
+	 * with Python's calendar.timegm, not this codebase's own math, so
+	 * this is a real independent check. */
+	double dates[] = {1705276800.0, 1708387200.0, -86400.0};
+	int lrc = wc_load_column_date("d", dates, 3);
+	CHECK(lrc == 0, "wc_load_column_date succeeds");
+
+	int rrc = wc_run("emit(col(\"d\"));");
+	CHECK(rrc == 0, "wc_run succeeds");
+	CHECK(g_n_emitted_col_date == 3, "all 3 dates were emitted");
+	CHECK(0 == strcmp(g_emitted_col_date_joined, "2024-01-15" "\x1f" "2024-02-20" "\x1f" "1969-12-31"),
+	      "emitted dates are formatted as ISO YYYY-MM-DD, in row order, including a date before the epoch");
+}
+
+static void test_date_builtin_parses_iso_strings(void) {
+	resetEmitted();
+	int rrc = wc_run(
+		"emit(date(\"2024-01-15\"));\n"
+		"emit(date(\"2024-06-15T08:30:00\"));\n"
+	);
+	CHECK(rrc == 0, "wc_run succeeds");
+	CHECK_DBL_EQ(g_emitted[0], 1705276800.0, "date() parses a bare ISO date to the matching epoch seconds");
+	CHECK_DBL_EQ(g_emitted[1], 1718440200.0, "date() parses an ISO date with a time-of-day component too");
+}
+
+static void test_date_builtin_rejects_malformed_input(void) {
+	resetEmitted();
+	int rrc = wc_run("emit(date(\"not-a-date\"));");
+	CHECK(rrc == -3, "date() on a malformed string is a runtime error, not a silent NaN/garbage value");
+}
+
+static void test_date_part_composes_with_groupby_and_emit(void) {
+	resetEmitted();
+	/* 2024-01-15 is a Monday, 2024-02-20 is a Tuesday (independently
+	 * verified with Python's datetime.date(...).strftime('%a')). */
+	double dates[] = {1705276800.0, 1708387200.0};
+	wc_load_column_date("d2", dates, 2);
+
+	int rrc = wc_run("groupby(date_part(col(\"d2\"), \"month\"));");
+	CHECK(rrc == 0, "wc_run succeeds");
+	CHECK(g_group_n == 2, "date_part(\"month\") gives 2 distinct groups for these 2 different months");
+	CHECK(0 == strcmp(g_group_labels_joined, "2024-01" "\x1f" "2024-02"), "month labels are formatted YYYY-MM");
+	CHECK_DBL_EQ(g_group_values[0], 1.0, "one row in 2024-01");
+	CHECK_DBL_EQ(g_group_values[1], 1.0, "one row in 2024-02");
+
+	resetEmitted();
+	rrc = wc_run("let w := date_part(col(\"d2\"), \"weekday\");\nemit(w);\n");
+	CHECK(rrc == 0, "wc_run succeeds");
+	CHECK(0 == strcmp(g_emitted_col_str_joined, "Mon" "\x1f" "Tue"), "date_part(\"weekday\") gives the correct day names");
+}
+
+static void test_date_part_rejects_unknown_unit(void) {
+	resetEmitted();
+	double dates[] = {1705276800.0};
+	wc_load_column_date("d3", dates, 1);
+
+	int rrc = wc_run("date_part(col(\"d3\"), \"century\");");
+	CHECK(rrc == -3, "date_part() with an unrecognized unit is a runtime error, not silently ignored");
+}
+
+static void test_filter_gt_works_on_date_columns(void) {
+	resetEmitted();
+	/* 2024-01-01, 2024-01-15, 2024-02-20. */
+	double dates[] = {1704067200.0, 1705276800.0, 1708387200.0};
+	wc_load_column_date("d4", dates, 3);
+
+	int rrc = wc_run(
+		"let recent := filter_gt(col(\"d4\"), date(\"2024-01-10\"));\n"
+		"emit(recent);\n"
+	);
+	CHECK(rrc == 0, "wc_run succeeds");
+	CHECK(g_n_emitted_col_date == 2, "filter_gt keeps only the 2 dates after 2024-01-10");
+	CHECK(0 == strcmp(g_emitted_col_date_joined, "2024-01-15" "\x1f" "2024-02-20"),
+	      "filter_gt's result is still a COL_DATE column (formats as dates, not raw numbers)");
+}
+
+static void test_sum_rejects_date_columns(void) {
+	resetEmitted();
+	double dates[] = {1705276800.0, 1708387200.0};
+	wc_load_column_date("d5", dates, 2);
+
+	int rrc = wc_run("emit(sum(col(\"d5\")));");
+	CHECK(rrc == -3, "sum() on a date column is a runtime error, not a silently wrong 0");
+}
+
 int main(void) {
 	test_init_and_basic_query();
 	test_sum_on_missing_column_is_a_runtime_error();
@@ -338,6 +432,13 @@ int main(void) {
 	test_groupby_rejects_two_args();
 	test_gpu_sum_exact_below_threshold_is_exact_and_cpu_only();
 	test_gpu_sum_exact_above_threshold_matches_cpu_exactly();
+	test_date_column_round_trips_via_emit();
+	test_date_builtin_parses_iso_strings();
+	test_date_builtin_rejects_malformed_input();
+	test_date_part_composes_with_groupby_and_emit();
+	test_date_part_rejects_unknown_unit();
+	test_filter_gt_works_on_date_columns();
+	test_sum_rejects_date_columns();
 
 	printf("\n%d passed, %d failed\n", g_pass, g_fail);
 	return g_fail == 0 ? 0 : 1;

@@ -28,7 +28,7 @@ GRAMMAR_DEFAULT = ../../resources/grammar-csv.txt
 CFLAGS = -Wall -Wextra -std=c11 -I$(VENDOR_SRC) -I$(EXT_SRC) -O2
 
 EXPORTED_FUNCS = \
-  _wc_init,_wc_load_column_f64,_wc_load_column_str_dict,_wc_run,_wc_reset_session,_malloc,_free
+  _wc_init,_wc_load_column_f64,_wc_load_column_str_dict,_wc_load_column_date,_wc_run,_wc_reset_session,_malloc,_free
 
 # HEAPF64 has to be listed explicitly - main.js/loadColumn's
 # wasmModule.HEAPF64.set(...) (and bridge.js's read of it) would otherwise

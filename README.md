@@ -2,9 +2,10 @@
 
 CSV analysis in the browser: upload a CSV, then query and transform it
 with [repl2](https://github.com/nchakicherla/repl2)'s configurable-grammar
-tree-walking interpreter, compiled to WASM. Numeric *and* categorical
-columns are supported (`col()`, `filter_gt()`, `groupby()` with
-sum/count/avg/min/max aggregates). Parallelizable operations (currently:
+tree-walking interpreter, compiled to WASM. Numeric, categorical, *and*
+date columns are supported (`col()`, `filter_gt()`, `groupby()` with
+sum/count/avg/min/max aggregates, `date()`/`date_part()` for parsing and
+bucketing dates by year/month/day/weekday). Parallelizable operations (currently:
 summing a numeric column) run as WebGPU compute shaders on eligible
 hardware, falling back to plain WASM otherwise - as either `gpu_sum()`
 (fast, f32 - see the precision tradeoff below) or `gpu_sum_exact()`
@@ -95,8 +96,8 @@ queries/dashboards yet.
 ## Sample data
 
 [web/sample-data/transactions.csv](web/sample-data/transactions.csv) - 20
-rows, `id`/`amount`/`category` columns. Upload it and run the default
-query in the textbox as-is:
+rows, `id`/`date`/`amount`/`category` columns. Upload it and run the
+default query in the textbox as-is:
 
 - `filter_gt(col("amount"), 100)` then `sum` -> `8183.23`
 - `gpu_sum(col("amount"))` (falls back to CPU at this size - see the
@@ -105,6 +106,12 @@ query in the textbox as-is:
   electronics: 1289.43, coffee: 62.23, rent: 2075.25, utilities: 580,
   travel: 4328}` (emitted as `{type:'groups', labels, values}`, not a
   plain object - see `agg` for which aggregate ran)
+- `groupby(date_part(col("date"), "month"), col("amount"), "sum")` ->
+  `{2024-01: 257.49, 2024-02: 1264.34, 2024-03: 1779.5, 2024-04: 4358.49,
+  2024-05: 852.19}` - `date_part()` turns the loaded `date` column (parsed
+  as UTC epoch seconds by `parse.js`, not a string) into per-row `"YYYY-MM"`
+  labels, which is what makes it groupable at all; see "Date/time columns"
+  below.
 - `groupby(col("category"))` (1-arg form) -> counts per category without
   needing a numeric column: `{groceries: 4, electronics: 3, coffee: 5,
   rent: 2, utilities: 3, travel: 3}` (sums to 20, the row count)
@@ -114,6 +121,38 @@ query in the textbox as-is:
   numeric column, which now also streams every value rather than a sum
 
 All hand-checked and matching what a real browser run actually returned.
+
+### Date/time columns
+
+A column loads as a date, not a plain string, when every non-empty cell
+matches `YYYY-MM-DD` (optionally with a `T`- or space-separated
+`HH:MM[:SS]`) - `parse.js`'s `DATE_RE`. It's converted to UTC epoch seconds
+*in JS* (`Date.UTC(...)` on the regex-captured fields, not `Date.parse()` -
+see the comment on `parseIsoDateToEpochSeconds` for why: `Date.parse()`
+treats a date-*time* string with no explicit offset as the browser's local
+time zone per spec, which would make the same CSV load different data
+depending on where it's opened) before it ever reaches WASM, so the C side
+never parses a date string at all except for a script's own `date("...")`
+literals.
+
+Two new builtins, both in `interp/ext/builtins_gpu.c`/`interp/ext/datetime.c`:
+
+- `date("2024-06-01")` -> a plain number (epoch seconds), for building a
+  comparison threshold: `filter_gt(col("order_date"), date("2024-06-01"))`
+  works today because `filter_gt` now accepts date columns as well as f64
+  (comparing epoch-seconds numbers is exactly comparing dates).
+- `date_part(col, "year" | "month" | "day" | "weekday")` -> a new
+  categorical column, one formatted label per row (`"2024"`, `"2024-06"`,
+  `"2024-06-01"`, `"Sat"`). This is what makes a date column composable
+  with `groupby()`, which needs a categorical column to group by -
+  `date_part(col("order_date"), "month")` is the "group by month" a real
+  BI tool would call a native operation, built here from two small pieces
+  instead of one bespoke one.
+
+`sum()` explicitly rejects a date column (summing epoch seconds isn't
+meaningful) rather than silently returning whatever `cpuSum()`'s
+unrecognized-type fallback would - see `interp/ext/test/test_builtins.c`'s
+`test_sum_rejects_date_columns`.
 
 ### A larger CSV, to actually exercise the GPU path
 
@@ -137,6 +176,7 @@ emit(gpu_sum(col("amount")));
 emit(gpu_sum_exact(col("amount")));
 groupby(col("category"), col("amount"), "sum");
 groupby(col("month"));
+groupby(date_part(col("date"), "month"), col("amount"), "sum");
 ```
 
 Expected, verified two independent ways (a plain-JS reduce over the raw
@@ -169,6 +209,16 @@ then confirmed a third way in the real browser:
 - `groupby(col("month"))` -> 12 groups, `jan`..`dec` in that order (the
   generator writes rows chronologically, and dictionary order is
   first-seen order - see ARCHITECTURE.md §5), each ~8,333 (100,000 / 12)
+- `groupby(date_part(col("date"), "month"), col("amount"), "sum")` -> 12
+  groups, `2025-01`..`2025-12`, **the same row split as `groupby(col("month"))`
+  above, bucket for bucket** (8334, 8333, 8333, 8334, ...) - confirming
+  `date_part()` derives the identical grouping from the real `date` column
+  that `generate.mjs` used to *write* the redundant `month` column in the
+  first place (see that file's own comment, now closed by this feature).
+  Sums: `{2025-01: 2219094.36, 2025-02: 2143173.97, 2025-03: 2211123.01,
+  2025-04: 2261224.10, 2025-05: 2240433.42, 2025-06: 2270369.99,
+  2025-07: 2213446.68, 2025-08: 2137260.87, 2025-09: 2183450.03,
+  2025-10: 2292573.16, 2025-11: 2197190.72, 2025-12: 2190191.11}`
 
 **A real bug turned up building this file** - large enough data to be
 worth recording. Loading `transactions-large.csv` through the UI crashed
@@ -291,6 +341,17 @@ with real WebGPU hardware:
     Against `transactions-large.csv` it returned a clean `26559531.42`
     where both `sum` and `gpu_sum` show floating-point noise of different
     kinds - see "A larger CSV" above.
+12. ✅ Date/time columns (`COL_DATE`, `date()`/`date_part()`) work
+    end to end in a real browser: `parse.js` detects and correctly parses
+    ISO date columns in both sample CSVs as UTC epoch seconds; `date_part(col,
+    "month")` composed with `groupby()` reproduces the exact same per-month
+    row counts as the hand-maintained `month` categorical column on the
+    100,000-row CSV (bucket for bucket - see "A larger CSV" above); a date
+    before the Unix epoch round-trips correctly through `emit()`
+    (`wcFormatDatePart`'s `floor()`, not truncation); `filter_gt()` on a
+    date column against a `date("...")` threshold correctly keeps only
+    later dates; and `sum()` on a date column fails loudly rather than
+    returning a silently meaningless 0.
 
 ### Bugs found doing the above (all fixed)
 
@@ -337,9 +398,13 @@ rather than a TODO waiting to be picked up:
   than a display.
 - Only three chart forms exist: stat tile (a bare number), bar chart (a
   `groupby` result), and table (a raw column or the accessibility twin of
-  a bar chart). There's no line/time-series chart, because there's no
-  date/time column type yet to plot against (`month` in the larger sample
-  CSV is just an ordinary categorical column, not a real date type).
+  a bar chart). There's now a real date column type (`COL_DATE` -
+  `date()`/`date_part()`, see "Date/time columns" above) to plot against,
+  but no dedicated line/time-series chart yet - a `date_part()` +
+  `groupby()` result renders as an ordinary bar chart today (which is
+  arguably still the right form for a handful of monthly buckets; it stops
+  being the right form once "date range" means finer-grained points than a
+  bar chart reads well as).
 - Loading a saved dashboard doesn't auto-run it (a deliberate choice: the
   CSV needs to be loaded first, and running immediately against nothing
   loaded would just error) - the user has to click "Run dashboard"
