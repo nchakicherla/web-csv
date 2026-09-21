@@ -32,11 +32,9 @@
 	<section>
 		<h2>Query</h2>
 		<label for="query">Query (grammar-csv.txt syntax):</label><br>
-		<textarea id="query" rows="9">let big := filter_gt(col("amount"), 100);
-emit(sum(big));
-emit(gpu_sum(col("amount")));
-emit(gpu_sum_exact(col("amount")));
+		<textarea id="query" rows="7">emit(gpu_sum_exact(col("amount")));
 groupby(col("category"), col("amount"), "sum");
+groupby(col("category"));
 groupby(date_part(col("date"), "month"), col("amount"), "sum");</textarea>
 
 		<div class="row">

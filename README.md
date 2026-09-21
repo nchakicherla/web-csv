@@ -56,69 +56,237 @@ server/test/             API integration tests
 docs/                  architecture notes
 ```
 
-## Prerequisites
+## Quick start
 
-- **Emscripten SDK** (`emcc`) - https://emscripten.org/docs/getting_started/downloads.html.
-  Installed via `emsdk` (`git clone https://github.com/emscripten-core/emsdk`,
-  `./emsdk install latest && ./emsdk activate latest`), not Homebrew -
-  `source /path/to/emsdk/emsdk_env.sh` before building.
-- **Node.js** (for `server/`, and it's what `emsdk` itself bundles) - any
-  reasonably recent version
-- A browser with WebGPU (recent Chrome/Edge; Firefox/Safari support is
-  still landing) to exercise the `gpu_sum` path - everything else works
-  without it, falling back to CPU
+Unless a step says otherwise, run these commands from the repository root.
 
-## Building the interpreter
+### Prerequisites
 
-```bash
-cd interp/ext
-make
-```
+- **Emscripten SDK** (`emcc`) to compile the C interpreter to WebAssembly.
+  Install it through [emsdk](https://emscripten.org/docs/getting_started/downloads.html),
+  not Homebrew.
+- **A Node.js LTS release** and npm for the local server. Using an LTS
+  release is recommended because `better-sqlite3` is a native dependency
+  and very new Node ABI versions may not have a compatible prebuilt binary.
+- **GNU Make** and a C toolchain.
+- **A recent Chrome or Edge** to demonstrate the real WebGPU path. The app
+  still works without WebGPU; GPU functions transparently use the CPU.
 
-Produces `web/src/wasm/interp.js` + `interp.wasm` (+ `.data` for the
-preloaded default grammar). Gitignored - rebuild after pulling.
-
-## Running
+Check the tools that are already available:
 
 ```bash
-cd server
-npm install
-npm start
+node --version
+npm --version
+make --version
+emcc --version
 ```
 
-Serves the frontend and the persistence API on `http://localhost:8787`
-(see `server/.env.example` for `PORT`/`WC_DB_PATH`). Open that URL, upload
-a CSV, and run the default query in the textbox - or without `server/` at
-all, serve `web/` with any static file server (e.g. `python3 -m http.server
-8080 --directory web`, or `npx serve web`) if you don't need saved
-queries/dashboards yet.
+To keep `emsdk` inside this repository (the directory is already ignored
+by Git), install it once with:
+
+```bash
+git clone https://github.com/emscripten-core/emsdk.git emsdk
+cd emsdk
+./emsdk install latest
+./emsdk activate latest
+cd ..
+source ./emsdk/emsdk_env.sh
+```
+
+On later runs, only load its environment in the new terminal:
+
+```bash
+source ./emsdk/emsdk_env.sh
+```
+
+`source` changes only the current shell unless it is also added to the
+shell startup file. If `emsdk` is elsewhere, substitute its actual path.
+After moving an existing `emsdk` directory, run `./emsdk activate latest`
+from its new location once, return to the repository root, and source the
+new `emsdk_env.sh` path.
+
+### First-time setup
+
+```bash
+make -C interp/ext
+npm install --prefix server
+```
+
+The interpreter build produces the gitignored files
+`web/src/wasm/interp.js`, `interp.wasm`, and `interp.data`. Re-run the
+build after changing C sources, the grammar, or Emscripten build flags.
+
+### Start the app
+
+```bash
+npm start --prefix server
+```
+
+Open <http://localhost:8787>. Keep that terminal running while using the
+app. A successful page load changes the status from **Loading
+interpreter...** to **Ready.** No frontend bundler or second development
+server is required.
+
+The Node service hosts both the static frontend and the persistence API.
+Its defaults are documented in `server/.env.example`: port `8787` and a
+SQLite database at `server/data/web-csv.sqlite`. Set `PORT` or
+`WC_DB_PATH` before starting the server to override them.
+
+To run only the frontend, without saved queries or dashboards, use a
+static server instead:
+
+```bash
+python3 -m http.server 8080 --directory web
+```
+
+Then open <http://localhost:8080>. Opening `web/index.html` directly as a
+`file://` URL will not work reliably because the page loads ES modules,
+WASM, and the preloaded grammar over HTTP.
+
+## Demo walkthrough
+
+For the strongest demo, use
+`web/sample-data/transactions-large.csv`. Its 100,000 rows are large
+enough to exercise the `gpu_sum()` WebGPU eligibility path in the GPU
+comparison below; the smaller `transactions.csv` is useful for a faster,
+easily hand-checked tour.
+
+1. Start the server and open <http://localhost:8787>. Wait for **Ready.**
+2. Click **CSV file** and select
+   `web/sample-data/transactions-large.csv` from this repository.
+3. Wait for the status to report the loaded numeric, date, and categorical
+   column counts. For the large sample it should report 3 numeric, 1 date,
+   and 4 categorical columns.
+4. Leave the starter query unchanged and click **Run**.
+5. Hover over chart marks to inspect values, and use **View as table** to
+   see the same grouped results in an accessible tabular form. Expand
+   **Raw JSON** to show the data contract between WASM and the renderer.
+
+The four default statements intentionally demonstrate four outputs:
+
+| Query | Result | Visualization |
+| --- | --- | --- |
+| `emit(gpu_sum_exact(col("amount")));` | Exact total amount (`26559531.42` for the large sample) | Stat tile |
+| `groupby(col("category"), col("amount"), "sum");` | Amount summed by category | Bar chart |
+| `groupby(col("category"));` | Row count by category | Bar chart |
+| `groupby(date_part(col("date"), "month"), col("amount"), "sum");` | Amount summed by calendar month | Line chart |
+
+The renderer selects the chart from the result shape: a number becomes a
+stat tile, ordinary groups become a bar chart, chronological groups become
+a line chart, and an emitted full column becomes a table.
+
+### Demonstrate the GPU precision tradeoff
+
+With the large CSV loaded, run these three statements together:
+
+```text
+emit(sum(col("amount")));
+emit(gpu_sum(col("amount")));
+emit(gpu_sum_exact(col("amount")));
+```
+
+They compare ordinary CPU f64 addition, fast WebGPU f32 addition, and the
+exact integer-cents implementation. Small differences in the first two
+results are expected floating-point behavior; the third returns the clean
+money total. On this sample, `gpu_sum()` is large enough to dispatch to
+WebGPU. `gpu_sum_exact()` deliberately uses its CPU fallback because the
+sample's absolute total in cents exceeds the safe i32 reduction bound.
+Without WebGPU, all three remain correct but use CPU fallbacks, so the
+result alone does not prove that a GPU dispatch occurred.
+
+### Build and save a dashboard
+
+1. Put one visualization statement in the query box and click **Add to
+   dashboard**. Give the tile a descriptive name.
+2. Repeat for the other statements you want as separate tiles. A tile can
+   also contain several statements and will render all of their outputs.
+3. Click **Run dashboard** to execute every tile against the currently
+   loaded CSV.
+4. Click **Save dashboard**, enter a name, and wait for the saved name to
+   appear in the dropdown.
+5. To demonstrate persistence, reload the page, upload the CSV again,
+   select the saved dashboard, click **Load**, and then click **Run
+   dashboard**.
+
+Only query text and tile titles are persisted. CSV data and rendered
+results are deliberately not saved, so the CSV must be uploaded again
+after a reload. **Save query** stores the current query separately from
+the dashboard feature through the API, but the current UI does not yet
+include a saved-query picker; use saved dashboards for the reload demo.
+
+## Writing queries
+
+Every statement ends with a semicolon, and column names must match the
+CSV header exactly. Useful patterns include:
+
+```text
+emit(sum(col("amount")));
+emit(col("category"));
+groupby(col("region"));
+groupby(col("channel"), col("amount"), "avg");
+groupby(date_part(col("date"), "weekday"), col("amount"), "sum");
+let large_orders := filter_gt(col("amount"), 500);
+emit(sum(large_orders));
+```
+
+`groupby(category)` counts rows. The three-argument form accepts `sum`,
+`count`, `avg`, `min`, or `max`. The `region` and `channel` examples need
+the large sample because those columns are not present in the 20-row CSV.
+`emit(col("category"))` renders every row, so use the small sample for that
+table example unless you intentionally want a 100,000-row DOM table.
+The language is a small function-call DSL, not SQL; see
+`resources/grammar-csv.txt` and `docs/ARCHITECTURE.md` for its grammar and
+execution model.
+
+## Troubleshooting
+
+- **The page stays on “Loading interpreter...” or reports a missing
+  `interp.js`, `.wasm`, or `.data` file:** run `make -C interp/ext`, then
+  refresh the page.
+- **`emcc: command not found`:** source `emsdk_env.sh` in the same terminal
+  before building. If `emsdk` was moved, reactivate it from its new
+  directory first.
+- **`better-sqlite3` reports that it cannot locate its bindings:** ensure
+  installation and startup use the same Node version, prefer a Node LTS
+  release, and run `npm rebuild better-sqlite3 --prefix server` after
+  changing Node versions.
+- **A query reports an unknown or missing column:** upload the CSV first
+  and check its header spelling and capitalization. Saved dashboards do
+  not restore their original CSV.
+- **The GPU result appears to use the CPU:** WebGPU must be available in
+  the browser and the numeric column must contain at least 50,000 values.
+  Use `transactions-large.csv`; the 20-row sample intentionally stays
+  below the threshold.
+- **The old starter query remains after pulling changes:** perform a hard
+  refresh; browsers may restore textarea contents across an ordinary
+  reload.
+- **Port 8787 is already in use:** start on another port, for example
+  `PORT=8788 npm start --prefix server`, then open
+  <http://localhost:8788>.
 
 ## Sample data
 
 [web/sample-data/transactions.csv](web/sample-data/transactions.csv) - 20
 rows, `id`/`date`/`amount`/`category` columns. Upload it and run the
-default query in the textbox as-is:
+default visualization query in the textbox as-is:
 
-- `filter_gt(col("amount"), 100)` then `sum` -> `8183.23`
-- `gpu_sum(col("amount"))` (falls back to CPU at this size - see the
-  eligibility gate in ARCHITECTURE.md) -> `8512.01`
+- `emit(gpu_sum_exact(col("amount")))` -> `8512.01`, rendered as a stat
+  tile (it falls back to the same exact CPU calculation below the GPU
+  eligibility threshold)
 - `groupby(col("category"), col("amount"), "sum")` -> `{groceries: 177.1,
   electronics: 1289.43, coffee: 62.23, rent: 2075.25, utilities: 580,
-  travel: 4328}` (emitted as `{type:'groups', labels, values}`, not a
-  plain object - see `agg` for which aggregate ran)
+  travel: 4328}`, rendered as a bar chart (emitted as
+  `{type:'groups', labels, values}`, not a plain object - see `agg` for
+  which aggregate ran)
+- `groupby(col("category"))` (1-arg form) -> counts per category without
+  needing a numeric column: `{groceries: 4, electronics: 3, coffee: 5,
+  rent: 2, utilities: 3, travel: 3}`, rendered as a bar chart
 - `groupby(date_part(col("date"), "month"), col("amount"), "sum")` ->
   `{2024-01: 257.49, 2024-02: 1264.34, 2024-03: 1779.5, 2024-04: 4358.49,
   2024-05: 852.19}` - `date_part()` turns the loaded `date` column (parsed
   as UTC epoch seconds by `parse.js`, not a string) into per-row `"YYYY-MM"`
-  labels, which is what makes it groupable at all; see "Date/time columns"
-  below.
-- `groupby(col("category"))` (1-arg form) -> counts per category without
-  needing a numeric column: `{groceries: 4, electronics: 3, coffee: 5,
-  rent: 2, utilities: 3, travel: 3}` (sums to 20, the row count)
-- `emit(col("category"))` -> all 20 category values, in row order,
-  resolved from the dictionary (`{type:'column', dtype:'string',
-  values:[...]}`) - not summarized, unlike `emit(col("amount"))` for a
-  numeric column, which now also streams every value rather than a sum
+  labels, which is what makes it groupable and renders it as a line chart;
+  see "Date/time columns" below.
 
 All hand-checked and matching what a real browser run actually returned.
 
@@ -221,11 +389,12 @@ then confirmed a third way in the real browser:
   suggest the CPU fallback silently ran instead.
 - `gpu_sum_exact(col("amount"))` -> **`26559531.42`** - clean, and
   genuinely exact, not merely close: it converts every value to integer
-  cents before upload and sums as `i32` on the GPU (`reduce_sum_i32.wgsl`),
-  and integer addition doesn't round. Confirmed to match a real dispatch
-  through actual `GPUBuffer`s, not the CPU fallback - see ARCHITECTURE.md
-  §8's "Fixing gpu_sum's precision, for money" for how and why this works
-  and what it assumes.
+  cents, and integer addition doesn't round. This particular sample's
+  absolute total exceeds the safe i32 bound, so the overflow guard returns
+  the same exact integer-cents result from CPU rather than dispatching an
+  unsafe shader. The real `reduce_sum_i32.wgsl` path is separately verified
+  with a GPU-safe 60,000-value dataset; see ARCHITECTURE.md §8's "Fixing
+  gpu_sum's precision, for money" for how the path and guard work.
 - `groupby(col("category"), col("amount"), "sum")` -> `{coffee: 188033.92,
   groceries: 3433538.13, utilities: 2156688.61, dining: 1158195.76,
   transport: 676631.37, electronics: 9594373.57, rent: 3451725.51,
@@ -310,7 +479,7 @@ with real WebGPU hardware:
    browser test existed).
 4. ✅ The full page flow works in a real browser: uploading
    `sample-data/transactions.csv` through the actual file input, running
-   the default query, and getting back the correct, hand-checked results
+   a representative query, and getting back the correct, hand-checked results
    (`8183.23`, `8512.01`) via `filter_gt`/`sum`/`emit`.
 5. ✅ `gpu_sum` actually round-trips through `reduce_sum.wgsl` on real
    WebGPU hardware - forced past the `WC_GPU_MIN_LEN` eligibility
