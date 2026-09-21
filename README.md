@@ -222,6 +222,8 @@ CSV header exactly. Useful patterns include:
 ```text
 emit(sum(col("amount")));
 emit(col("category"));
+emit(unique(col("category")));
+emit(unique(date_part(col("date"), "month")));
 groupby(col("region"));
 groupby(col("channel"), col("amount"), "avg");
 groupby(date_part(col("date"), "weekday"), col("amount"), "sum");
@@ -234,6 +236,12 @@ emit(sum(large_orders));
 the large sample because those columns are not present in the 20-row CSV.
 `emit(col("category"))` renders every row, so use the small sample for that
 table example unless you intentionally want a 100,000-row DOM table.
+`unique(col)` returns a new column holding each distinct value once, in the
+order first seen, and works on text, number, and date columns (all empty
+cells count as one value); `emit(unique(col("category")))` is the
+one-row-per-category list, no aggregate needed. Because it returns a
+column rather than emitting, it composes: `unique(date_part(...))` lists the
+distinct months.
 The language is a small function-call DSL, not SQL; see
 `resources/grammar-csv.txt` and `docs/ARCHITECTURE.md` for its grammar and
 execution model.

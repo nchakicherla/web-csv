@@ -150,6 +150,126 @@ Column *columnCreateStrDict(const char *name, const char *const *values, uint32_
 	return col;
 }
 
+/* Sort key for numeric dedupe: value, then original row index, so the
+ * first entry of every run of equal values is that value's first-seen
+ * row. NaN sorts last and equals itself (== would say NaN != NaN and
+ * make qsort's ordering inconsistent). */
+typedef struct {
+	double v;
+	uint32_t idx;
+} UniqueKey;
+
+static int cmpUniqueKey(const void *pa, const void *pb) {
+	const UniqueKey *a = pa, *b = pb;
+	int a_nan = a->v != a->v, b_nan = b->v != b->v;
+
+	if (a_nan || b_nan) {
+		if (a_nan != b_nan) {
+			return a_nan ? 1 : -1;
+		}
+	} else if (a->v != b->v) {
+		return a->v < b->v ? -1 : 1;
+	}
+	return (a->idx > b->idx) - (a->idx < b->idx);
+}
+
+static int uniqueKeysEqual(double a, double b) {
+	return a == b || (a != a && b != b);
+}
+
+static Column *uniqueStrDict(const Column *col) {
+	uint32_t i, n = 0;
+	int32_t *remap = malloc(sizeof(int32_t) * (col->dict_len ? col->dict_len : 1));
+	int32_t *codes = malloc(sizeof(int32_t) * (col->dict_len ? col->dict_len : 1));
+	char **dict = malloc(sizeof(char *) * (col->dict_len ? col->dict_len : 1));
+	Column *out = NULL;
+
+	if (!remap || !codes || !dict) {
+		goto done;
+	}
+	for (i = 0; i < col->dict_len; i++) {
+		remap[i] = -1;
+	}
+	/* First-seen order by row, not by dictionary index: the dictionary
+	 * can hold entries no row references, and its order needn't match
+	 * row order for a column built by columnCreateStrDictOwned. */
+	for (i = 0; i < col->len; i++) {
+		int32_t code = col->data.i32[i];
+		if (code < 0 || (uint32_t)code >= col->dict_len || remap[code] >= 0) {
+			continue;
+		}
+		dict[n] = dupStr(col->dict[code]);
+		if (!dict[n]) {
+			while (n > 0) {
+				free(dict[--n]);
+			}
+			goto done;
+		}
+		remap[code] = (int32_t)n;
+		codes[n] = (int32_t)n;
+		n++;
+	}
+	out = columnCreateStrDictOwned(col->name, codes, n, dict, n);
+	if (out) {
+		codes = NULL; /* owned by `out` now */
+		dict = NULL;
+	} else {
+		while (n > 0) {
+			free(dict[--n]);
+		}
+	}
+done:
+	free(remap);
+	free(codes);
+	free(dict);
+	return out;
+}
+
+static Column *uniqueNumeric(const Column *col) {
+	uint32_t i, n = 0, len = col->len;
+	UniqueKey *keys = malloc(sizeof(UniqueKey) * (len ? len : 1));
+	uint8_t *first = calloc(len ? len : 1, 1);
+	double *vals = malloc(sizeof(double) * (len ? len : 1));
+	Column *out = NULL;
+
+	if (!keys || !first || !vals) {
+		goto done;
+	}
+	for (i = 0; i < len; i++) {
+		keys[i].v = col->data.f64[i];
+		keys[i].idx = i;
+	}
+	qsort(keys, len, sizeof(UniqueKey), cmpUniqueKey);
+	for (i = 0; i < len; i++) {
+		if (i == 0 || !uniqueKeysEqual(keys[i].v, keys[i - 1].v)) {
+			first[keys[i].idx] = 1;
+		}
+	}
+	for (i = 0; i < len; i++) {
+		if (first[i]) {
+			vals[n++] = col->data.f64[i];
+		}
+	}
+	out = col->type == COL_DATE ? columnCreateDate(col->name, vals, n) : columnCreateF64(col->name, vals, n);
+done:
+	free(keys);
+	free(first);
+	free(vals);
+	return out;
+}
+
+Column *columnUnique(const Column *col) {
+	switch (col->type) {
+	case COL_STR_DICT:
+		return uniqueStrDict(col);
+	case COL_F64:
+	case COL_DATE:
+		return uniqueNumeric(col);
+	default:
+		return NULL;
+	}
+}
+
 void columnFree(Column *col) {
 	if (!col) {
 		return;

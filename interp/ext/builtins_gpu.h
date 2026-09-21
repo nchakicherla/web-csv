@@ -2,7 +2,8 @@
 #define WC_BUILTINS_GPU_H
 
 /* builtins_gpu.h - the native functions a CSV-analysis grammar's scripts
- * can call: col(), sum(), gpu_sum(), filter_gt(), emit(). Wired in as the
+ * can call: col(), sum(), gpu_sum(), filter_gt(), unique(), groupby(), emit(), and the
+ * date helpers. Wired in as the
  * interpreter's NativeFn hook (see vendor/VENDORED.md) - repl2 itself knows
  * nothing about any of this.
  */

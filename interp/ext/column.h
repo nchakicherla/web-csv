@@ -71,6 +71,16 @@ Column *columnCreateStrDictOwned(const char *name, int32_t *codes, uint32_t len,
  * that changes, not needed to be correct today. */
 Column *columnCreateStrDict(const char *name, const char *const *values, uint32_t len);
 
+/* The distinct values of `col`, as a new column of the same type, in
+ * first-seen row order (COL_STR_DICT: a dictionary with every entry
+ * appearing exactly once, codes 0..n-1). COL_F64/COL_DATE compare by
+ * value with all NaNs (empty CSV cells) counting as one value; COL_I32
+ * is unsupported. Cost is O(len) for a categorical column and
+ * O(len log len) for a numeric/date one, independent of cardinality -
+ * unlike columnCreateStrDict's linear dictionary scan. NULL on
+ * unsupported type or allocation failure. Caller owns the result. */
+Column *columnUnique(const Column *col);
+
 void columnFree(Column *col);
 
 uint32_t columnLen(const Column *col);

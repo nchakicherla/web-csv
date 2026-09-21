@@ -177,10 +177,9 @@ static void test_str_dict_column_loads_and_dedupes(void) {
 	int lrc = wc_load_column_str_dict("category", categories, 6);
 	CHECK(lrc == 0, "wc_load_column_str_dict succeeds");
 
-	/* No direct way to inspect a column's contents from script (no
-	 * "count distinct" builtin yet) - groupby's own test below is the
-	 * real exercise of this data; this just confirms the load itself
-	 * doesn't error and the column is retrievable by name. */
+	/* groupby's and unique()'s own tests are the real exercise of this
+	 * data; this just confirms the load itself doesn't error and the
+	 * column is retrievable by name. */
 	int rrc = wc_run("let c := col(\"category\");\n");
 	CHECK(rrc == 0, "col(\"category\") resolves after loading");
 }
@@ -415,6 +414,73 @@ static void test_sum_rejects_date_columns(void) {
 	CHECK(rrc == -3, "sum() on a date column is a runtime error, not a silently wrong 0");
 }
 
+static void test_unique_categorical_lists_distinct_values_first_seen(void) {
+	resetEmitted();
+	const char *categories = "b" "\x1f" "a" "\x1f" "b" "\x1f" "c" "\x1f" "a" "\x1f" "b";
+	wc_load_column_str_dict("ucat", categories, 6);
+
+	int rrc = wc_run("emit(unique(col(\"ucat\")));");
+	CHECK(rrc == 0, "wc_run succeeds");
+	CHECK(g_n_emitted_col_str == 3, "6 rows with 3 distinct values give 3 rows");
+	CHECK(0 == strcmp(g_emitted_col_str_joined, "b" "\x1f" "a" "\x1f" "c"), "distinct values are in first-seen row order, each once");
+
+	resetEmitted();
+	rrc = wc_run("groupby(unique(col(\"ucat\")));");
+	CHECK(rrc == 0, "the result is a real categorical column groupby() accepts");
+	CHECK(g_group_n == 3, "3 groups");
+	CHECK_DBL_EQ(g_group_values[0], 1.0, "each distinct value appears once in the unique column");
+	CHECK_DBL_EQ(g_group_values[1], 1.0, "...including the ones that were repeated in the source");
+	CHECK_DBL_EQ(g_group_values[2], 1.0, "...and the one that wasn't");
+}
+
+static void test_unique_numeric_first_seen_with_nan_collapsed(void) {
+	resetEmitted();
+	double vals[] = {3, 1, 3, NAN, 2, 1, NAN, 3, 0.0, -0.0};
+
+	wc_load_column_f64("unums", vals, 10);
+
+	int rrc = wc_run("emit(unique(col(\"unums\")));");
+	CHECK(rrc == 0, "wc_run succeeds");
+	CHECK(g_n_emitted_col_f64 == 5, "3, 1, NaN, 2, 0 - all NaNs are one value, 0 and -0 are one value");
+	CHECK_DBL_EQ(g_emitted_col_f64[0], 3.0, "first-seen order: 3 first");
+	CHECK_DBL_EQ(g_emitted_col_f64[1], 1.0, "then 1");
+	CHECK(g_emitted_col_f64[2] != g_emitted_col_f64[2], "then NaN, at its first position");
+	CHECK_DBL_EQ(g_emitted_col_f64[3], 2.0, "then 2");
+	CHECK_DBL_EQ(g_emitted_col_f64[4], 0.0, "then 0");
+}
+
+static void test_unique_date_stays_a_date_column(void) {
+	resetEmitted();
+	/* 2024-01-15, 2024-02-20, 2024-01-15 again. */
+	double dates[] = {1705276800.0, 1708387200.0, 1705276800.0};
+	wc_load_column_date("udates", dates, 3);
+
+	int rrc = wc_run("emit(unique(col(\"udates\")));");
+	CHECK(rrc == 0, "wc_run succeeds");
+	CHECK(g_n_emitted_col_date == 2, "2 distinct dates");
+	CHECK(0 == strcmp(g_emitted_col_date_joined, "2024-01-15" "\x1f" "2024-02-20"), "still a COL_DATE column (formats as ISO dates)");
+}
+
+static void test_unique_composes_and_handles_empty_and_bad_input(void) {
+	resetEmitted();
+	double dates[] = {1705276800.0, 1705363200.0, 1708387200.0}; /* Jan 15, Jan 16, Feb 20 */
+	wc_load_column_date("udates2", dates, 3);
+	int rrc = wc_run("emit(unique(date_part(col(\"udates2\"), \"month\")));");
+	CHECK(rrc == 0, "unique() takes a date_part() result");
+	CHECK(0 == strcmp(g_emitted_col_str_joined, "2024-01" "\x1f" "2024-02"), "distinct months of the date column");
+
+	resetEmitted();
+	wc_load_column_str_dict("uempty", NULL, 0);
+	rrc = wc_run("emit(unique(col(\"uempty\")));");
+	CHECK(rrc == 0, "unique() of an empty column is an empty column, not an error");
+	CHECK(g_n_emitted_col_str == 0, "...with no rows");
+
+	rrc = wc_run("unique(5);");
+	CHECK(rrc == -3, "unique() of a non-column is a runtime error");
+	rrc = wc_run("unique(col(\"ucat\"), col(\"ucat\"));");
+	CHECK(rrc == -3, "unique() with the wrong arity is a runtime error");
+}
+
 int main(void) {
 	test_init_and_basic_query();
 	test_sum_on_missing_column_is_a_runtime_error();
@@ -439,6 +505,10 @@ int main(void) {
 	test_date_part_rejects_unknown_unit();
 	test_filter_gt_works_on_date_columns();
 	test_sum_rejects_date_columns();
+	test_unique_categorical_lists_distinct_values_first_seen();
+	test_unique_numeric_first_seen_with_nan_collapsed();
+	test_unique_date_stays_a_date_column();
+	test_unique_composes_and_handles_empty_and_bad_input();
 
 	printf("\n%d passed, %d failed\n", g_pass, g_fail);
 	return g_fail == 0 ? 0 : 1;

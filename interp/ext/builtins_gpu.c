@@ -376,6 +376,31 @@ static bool doFilterGt(Object *args, size_t n_args, Object *out) {
 	return true;
 }
 
+/* unique(col) -> new column of col's distinct values, first-seen order,
+ * same type as the input (categorical, number, or date). The way to list
+ * a column's categories without going through groupby(): emit() it for a
+ * table, or feed it to anything else that takes a column. A returned
+ * column rather than a direct emit like groupby's, since there's no
+ * label/value pairing to carry - it's just a shorter column. */
+static bool doUnique(Object *args, size_t n_args, Object *out) {
+	Column *col, *result;
+
+	if (n_args != 1) {
+		return false;
+	}
+	col = objAsColumn(args[0]);
+	if (!col) {
+		return false;
+	}
+	result = columnUnique(col);
+	if (!result) {
+		return false;
+	}
+	storeTrack(result);
+	*out = objColumn(result);
+	return true;
+}
+
 /* groupby(categorical_col, numeric_col, agg) -> aggregates numeric_col's
  * values per group of categorical_col ("sum"/"count"/"avg"/"min"/"max"),
  * one result per distinct category, and emits it directly as a
@@ -560,6 +585,9 @@ bool wcNativeDispatch(Interp *in, const char *name, size_t len, Object *args,
 	}
 	if (len == 9 && 0 == memcmp(name, "filter_gt", 9)) {
 		return doFilterGt(args, n_args, out);
+	}
+	if (len == 6 && 0 == memcmp(name, "unique", 6)) {
+		return doUnique(args, n_args, out);
 	}
 	if (len == 7 && 0 == memcmp(name, "groupby", 7)) {
 		return doGroupby(args, n_args, out);
