@@ -12,6 +12,9 @@ CC = gcc
 VENDOR_SRC = ../../vendor/repl2/src
 EXT_SRC = ..
 CFLAGS = -Wall -Wextra -std=c11 -I$(VENDOR_SRC) -I$(EXT_SRC) -I. -g -O0
+# After the sources (link order matters): llround/floor live in libm, which
+# newer glibc toolchains no longer pull in implicitly.
+LDLIBS = -lm
 
 SRC = $(wildcard $(VENDOR_SRC)/*.c) $(wildcard $(EXT_SRC)/*.c) js_stubs.c test_builtins.c
 BIN = test_builtins
@@ -22,7 +25,7 @@ test: $(BIN)
 	./$(BIN)
 
 $(BIN): $(SRC) emscripten.h
-	$(CC) $(CFLAGS) $(SRC) -o $(BIN)
+	$(CC) $(CFLAGS) $(SRC) -o $(BIN) $(LDLIBS)
 
 clean:
 	rm -f $(BIN)
